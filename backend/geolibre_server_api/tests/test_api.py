@@ -1698,12 +1698,12 @@ def test_existing_sqlite_schema_is_upgraded_additively(tmp_path):
         ).one()
         owner_info = next(
             row
-            for row in upgraded.exec_driver_sql("PRAGMA table_info(projects)")
+            for row in upgraded.exec_driver_sql("PRAGMA table_info(projects)").all()
             if row[1] == "owner_id"
         )
         owner_delete_action = next(
             row[6]
-            for row in upgraded.exec_driver_sql("PRAGMA foreign_key_list(projects)")
+            for row in upgraded.exec_driver_sql("PRAGMA foreign_key_list(projects)").all()
             if row[3] == "owner_id"
         )
         assert (
