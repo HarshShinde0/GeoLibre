@@ -19,6 +19,7 @@ import {
   ExternalLink,
   KeyRound,
   Loader2,
+  LogIn,
   Share2,
   TriangleAlert,
 } from "lucide-react";
@@ -26,6 +27,15 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useDesktopSettingsStore } from "../../hooks/useDesktopSettings";
 import { openExternalLink } from "../../lib/open-external";
+import {
+  getShareAccessToken,
+  resolveShareRequestToken,
+  ShareOAuthError,
+  shareOAuthErrorKey,
+  signInToShare,
+  supportsShareOAuth,
+  useShareOAuthStore,
+} from "../../lib/share-oauth";
 import {
   isShareableTitle,
   MAX_PROJECT_TITLE_LENGTH,
@@ -39,6 +49,9 @@ import {
 } from "../../lib/share-geolibre";
 import {
   checkShareReadiness,
+  findLocalShareSources,
+  isMissingForRecipients,
+  type ShareReadinessInput,
   type ShareReadinessItem,
   type ShareReadinessReport,
 } from "../../lib/share-readiness";
@@ -64,6 +77,29 @@ interface ShareProjectDialogProps {
   getProject: (
     title: string,
   ) => Promise<{ content: string; filename: string; redactedCount?: number }>;
+}
+
+/** The user guide section on what a shared project can and cannot carry. */
+const SHARING_LOCAL_DATA_DOCS_URL = "https://geolibre.app/user-guide/projects/#sharing-local-data";
+
+/**
+ * What the readiness checks look at: the live layers plus the project-level
+ * URLs. Read once per dialog open rather than subscribed: the dialog is modal,
+ * so the snapshot it opens on is the project that will be uploaded.
+ */
+function readinessInput(): ShareReadinessInput {
+  const state = useAppStore.getState();
+  return {
+    layers: state.layers,
+    basemapStyleUrl: state.basemapVisible ? state.basemapStyleUrl : null,
+    pluginManifestUrls: state.projectPlugins?.manifestUrls ?? [],
+    // The publish path embeds these layers' features, so their local origin
+    // costs the recipient nothing. Taken from the same predicate that path uses
+    // so the two cannot drift.
+    embeddedLayerIds: new Set(
+      state.layers.filter(isEmbeddableLocalVectorLayer).map((layer) => layer.id),
+    ),
+  };
 }
 
 /**
@@ -147,6 +183,58 @@ function readinessCopyKeys(item: ShareReadinessItem) {
   }
 }
 
+/**
+ * The warning for layers that only exist on the author's machine (issue
+ * #2360). Unlike the advisory list below it, this is the one case with no
+ * "it may still work" reading: the share host stores the project file and
+ * nothing else, so every listed layer is empty for every recipient. It is
+ * shown the moment the dialog opens, before and regardless of the token setup,
+ * because an author without a token may go and upload the saved file by hand.
+ */
+function LocalDataWarning({
+  problems,
+  shareHost,
+}: {
+  problems: readonly ShareReadinessItem[];
+  shareHost: string;
+}) {
+  const { t } = useTranslation();
+  if (problems.length === 0) return null;
+  return (
+    <div
+      role="alert"
+      data-testid="share-local-warning"
+      className="space-y-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm"
+    >
+      <p className="flex items-center gap-2 font-medium">
+        <TriangleAlert className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        {t("share.localWarningTitle", { count: problems.length })}
+      </p>
+      <p className="text-xs text-muted-foreground">{t("share.localWarningBody", { shareHost })}</p>
+      <ul className="max-h-40 space-y-1 overflow-y-auto">
+        {problems.map((item) => (
+          <li key={`${item.layerId ?? item.field}:${item.url}`} className="space-y-0.5">
+            <p className="truncate font-medium" title={item.url || undefined}>
+              {readinessLabel(item, t)}
+            </p>
+            <p className="text-xs text-muted-foreground">{t(readinessCopyKeys(item).reason)}</p>
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-muted-foreground">
+        {t("share.localWarningAdvice")}{" "}
+        <button
+          type="button"
+          className="underline underline-offset-2 hover:text-foreground"
+          onClick={() => void openExternalLink(SHARING_LOCAL_DATA_DOCS_URL)}
+        >
+          {t("share.localWarningLearnMore")}
+        </button>
+      </p>
+    </div>
+  );
+}
+
 export function ShareProjectDialog({
   open,
   onOpenChange,
@@ -160,8 +248,15 @@ export function ShareProjectDialog({
   // Named in the copy below, so a self-hosted deployment reads its own host.
   const shareHost = shareHostLabel();
   const shareToken = useDesktopSettingsStore((s) => s.desktopSettings.shareToken);
+  // Web-only OAuth session. On desktop/embed both flags stay inert and the
+  // pasted personal-API-token path below behaves exactly as before Stack 3.
+  const oauthSupported = supportsShareOAuth();
+  const oauthIssuer = useShareOAuthStore((s) => s.issuer);
+  const oauthPending = useShareOAuthStore((s) => s.pending);
+  const oauthSignedIn = oauthSupported && oauthIssuer !== null;
+  const [oauthError, setOauthError] = useState<string | null>(null);
   const [title, setTitle] = useState("");
-  const [visibility, setVisibility] = useState<ShareVisibility>("unlisted");
+  const [visibility, setVisibility] = useState<ShareVisibility>("public");
   const [status, setStatus] = useState<"idle" | "uploading">("idle");
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<ShareUploadErrorCode | null>(null);
@@ -170,6 +265,7 @@ export function ShareProjectDialog({
   const [redactedCount, setRedactedCount] = useState(0);
   const [readiness, setReadiness] = useState<ShareReadinessReport | null>(null);
   const [readinessState, setReadinessState] = useState<"idle" | "checking" | "failed">("idle");
+  const [localProblems, setLocalProblems] = useState<ShareReadinessItem[]>([]);
   const [organizations, setOrganizations] = useState<ShareOrganization[]>([]);
   const [groups, setGroups] = useState<ShareGroup[]>([]);
   const [orgLoading, setOrgLoading] = useState(false);
@@ -178,10 +274,24 @@ export function ShareProjectDialog({
   const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([]);
   const membershipAbortRef = useRef<AbortController | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
+  const titleInputRef = useRef<HTMLInputElement>(null);
+  const getTokenButtonRef = useRef<HTMLButtonElement>(null);
   const copyTimeoutRef = useRef<number | null>(null);
 
-  const hasToken = shareToken.trim().length > 0;
+  const hasToken = oauthSignedIn || shareToken.trim().length > 0;
   const titleValid = isShareableTitle(title);
+  // The verdicts that are missing for everyone have their own block above the
+  // form, so the probe report lists the rest: what the network settled, plus a
+  // private-network host, which may still load for the intended recipients.
+  // A row already in that block is not repeated here, whatever verdict the
+  // probe summary kept for it. Keyed the way summarizeShareSources keys its
+  // rows: the layer id, or field plus URL for a project-level reference.
+  const rowKey = (item: ShareReadinessItem) => item.layerId ?? `${item.field}:${item.url}`;
+  const missingKeys = new Set(localProblems.map(rowKey));
+  const isRemoteRow = (item: ShareReadinessItem) =>
+    !isMissingForRecipients(item) && !missingKeys.has(rowKey(item));
+  const remoteProblems = readiness?.problems.filter(isRemoteRow) ?? [];
+  const remoteItemCount = readiness?.items.filter(isRemoteRow).length ?? 0;
 
   const selectedOrganization =
     organizations.find((organization) => organization.id === selectedOrgId) ?? null;
@@ -198,16 +308,18 @@ export function ShareProjectDialog({
   }, [open, currentTitle]);
 
   // Reset transient state whenever the dialog is (re)opened so a prior result or
-  // error never lingers into a new share.
+  // error never lingers into a new share, and load the caller's organizations
+  // and groups for the owner and group pickers.
   useEffect(() => {
     if (open) {
-      setVisibility("unlisted");
+      setVisibility("public");
       setStatus("idle");
       setError(null);
       setErrorCode(null);
       setResult(null);
       setCopied(false);
       setRedactedCount(0);
+      setOauthError(null);
       setSelectedOrgId(null);
       setSelectedGroupIds([]);
       setOrganizations([]);
@@ -218,11 +330,15 @@ export function ShareProjectDialog({
       if (hasToken) {
         const controller = new AbortController();
         membershipAbortRef.current = controller;
-        const fetchOptions = {
-          token: shareToken,
-          signal: controller.signal,
-        };
-        fetchMyOrganizations(fetchOptions)
+        // Same credential precedence as the upload: the OAuth session when
+        // signed in, else the pasted personal token. A failure only hides the
+        // pickers; the upload itself reports credential problems.
+        const memberships = resolveShareRequestToken(shareToken).then((token) => {
+          if (!token) throw new Error("no share credential");
+          return { token, signal: controller.signal };
+        });
+        memberships
+          .then(fetchMyOrganizations)
           .then((orgs) => {
             if (controller.signal.aborted) return;
             setOrganizations(orgs);
@@ -233,7 +349,8 @@ export function ShareProjectDialog({
             setOrganizations([]);
             setOrgLoading(false);
           });
-        fetchMyGroups(fetchOptions)
+        memberships
+          .then(fetchMyGroups)
           .then((grps) => {
             if (controller.signal.aborted) return;
             setGroups(grps);
@@ -258,30 +375,23 @@ export function ShareProjectDialog({
   // learns that a layer will be empty for everyone else *before* the upload
   // rather than when a recipient tells them (if they tell them).
   //
-  // Advisory only: it never gates the Share button. An author sharing an
-  // intranet map with intranet colleagues is doing the right thing.
+  // Layers that only exist on this machine are settled without the network,
+  // so they are listed at once, token or no token. The probes need the token
+  // only because there is no upload to pre-flight without one. Advisory only:
+  // neither gates the Share button. An author sharing an intranet map with
+  // intranet colleagues is doing the right thing.
   useEffect(() => {
-    if (!open || !hasToken) return;
+    if (!open) {
+      setLocalProblems([]);
+      return;
+    }
+    const input = readinessInput();
+    setLocalProblems(findLocalShareSources(input));
+    if (!hasToken) return;
     const controller = new AbortController();
     setReadinessState("checking");
     setReadiness(null);
-    // Read the live layers once rather than subscribing: the dialog is modal,
-    // so the snapshot it opens on is the project that will be uploaded.
-    const state = useAppStore.getState();
-    void checkShareReadiness(
-      {
-        layers: state.layers,
-        basemapStyleUrl: state.basemapVisible ? state.basemapStyleUrl : null,
-        pluginManifestUrls: state.projectPlugins?.manifestUrls ?? [],
-        // The publish path embeds these layers' features, so their local origin
-        // costs the recipient nothing. Taken from the same predicate that path
-        // uses so the two cannot drift.
-        embeddedLayerIds: new Set(
-          state.layers.filter(isEmbeddableLocalVectorLayer).map((layer) => layer.id),
-        ),
-      },
-      { signal: controller.signal },
-    )
+    void checkShareReadiness(input, { signal: controller.signal })
       .then((report) => {
         if (controller.signal.aborted) return;
         setReadiness(report);
@@ -304,6 +414,22 @@ export function ShareProjectDialog({
     [],
   );
 
+  // Web sign-in opens the consent popup. Failures surface as translated
+  // guidance keyed by ShareOAuthError code; the session store updates on
+  // success, which re-runs the readiness probe effect below (hasToken flips).
+  const handleSignIn = () => {
+    setOauthError(null);
+    signInToShare()
+      .then(() => {
+        setErrorCode((code) => (code === "unauthorized" ? null : code));
+      })
+      .catch((err: unknown) => {
+        setOauthError(
+          t(err instanceof ShareOAuthError ? shareOAuthErrorKey(err.code) : "share.oauthFailed"),
+        );
+      });
+  };
+
   const handleShare = async () => {
     // Guard re-entry synchronously: a second click before the disabled state
     // renders would otherwise start a concurrent, non-idempotent upload.
@@ -314,9 +440,30 @@ export function ShareProjectDialog({
     const controller = new AbortController();
     uploadAbortRef.current = controller;
     try {
+      // Prefer OAuth; a pasted personal token remains a fallback when OAuth is
+      // unavailable or its refresh endpoint is temporarily unreachable.
+      let oauthToken: string | null = null;
+      if (oauthSupported) {
+        try {
+          oauthToken = await getShareAccessToken();
+        } catch (err) {
+          if (
+            !(err instanceof ShareOAuthError) ||
+            err.code !== "refresh-unavailable" ||
+            !shareToken.trim()
+          ) {
+            throw err;
+          }
+        }
+      }
+      if (oauthSupported && !oauthToken && !shareToken.trim()) {
+        setErrorCode("unauthorized");
+        setError(null);
+        return;
+      }
       const { content, filename, redactedCount: removed = 0 } = await getProject(title.trim());
       const uploaded = await uploadProjectToShare({
-        token: shareToken,
+        token: oauthToken ?? shareToken,
         filename,
         content,
         visibility,
@@ -330,12 +477,20 @@ export function ShareProjectDialog({
       if (err instanceof DOMException && err.name === "AbortError") return;
       // A missing account username gets dedicated, actionable UI (a deep link to
       // the website's settings) rather than the raw server string.
-      if (err instanceof ShareUploadError && err.code === "username-required") {
-        setErrorCode("username-required");
+      if (
+        err instanceof ShareUploadError &&
+        (err.code === "username-required" || err.code === "unauthorized")
+      ) {
+        setErrorCode(err.code);
         setError(null);
       } else {
-        setError(err instanceof Error ? err.message : t("share.errorFallback"));
-        setErrorCode(null);
+        setError(
+          err instanceof ShareOAuthError
+            ? t(shareOAuthErrorKey(err.code))
+            : err instanceof Error
+              ? err.message
+              : t("share.errorFallback"),
+        );
       }
     } finally {
       // Only the controller that is still current clears state, so an aborted
@@ -395,7 +550,18 @@ export function ShareProjectDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent
+        className="sm:max-w-lg"
+        // The local-data warning sits above both the form and the setup steps
+        // and carries a link, which would otherwise take the dialog's initial
+        // focus away from the title field or the first setup step.
+        onOpenAutoFocus={(event) => {
+          const target = titleInputRef.current ?? getTokenButtonRef.current;
+          if (!target) return;
+          event.preventDefault();
+          target.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Share2 className="h-4 w-4" />
@@ -406,6 +572,33 @@ export function ShareProjectDialog({
 
         {!hasToken ? (
           <div className="space-y-4 text-sm">
+            <LocalDataWarning problems={localProblems} shareHost={shareHost} />
+            {oauthSupported ? (
+              <div className="space-y-2 rounded-md border p-3">
+                <p className="font-medium">{t("share.oauthTitle")}</p>
+                <p className="text-muted-foreground">
+                  {t("share.oauthSetupDescription", { shareHost })}
+                </p>
+                <Button
+                  ref={oauthSupported ? getTokenButtonRef : undefined}
+                  type="button"
+                  onClick={handleSignIn}
+                  disabled={oauthPending}
+                >
+                  {oauthPending ? (
+                    <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <LogIn className="me-2 h-3.5 w-3.5" />
+                  )}
+                  {oauthPending ? t("share.oauthSigningIn") : t("share.oauthSignIn", { shareHost })}
+                </Button>
+                {oauthError ? (
+                  <p role="alert" className="text-xs text-destructive">
+                    {oauthError}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
             <p className="text-muted-foreground">{t("share.setupIntro", { shareHost })}</p>
             <ol className="space-y-3">
               <li className="space-y-2 rounded-md border p-3">
@@ -414,6 +607,7 @@ export function ShareProjectDialog({
                   {t("share.step1Description", { shareHost })}
                 </p>
                 <Button
+                  ref={oauthSupported ? undefined : getTokenButtonRef}
                   type="button"
                   variant="outline"
                   onClick={() => void openExternalLink(settingsUrl)}
@@ -467,16 +661,17 @@ export function ShareProjectDialog({
           </div>
         ) : (
           <div className="space-y-4">
+            <LocalDataWarning problems={localProblems} shareHost={shareHost} />
             <div className="space-y-1.5">
               <Label htmlFor="share-title">{t("share.projectTitle")}</Label>
               <Input
+                ref={titleInputRef}
                 id="share-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
                 placeholder={t("share.titlePlaceholder")}
                 maxLength={MAX_PROJECT_TITLE_LENGTH}
                 disabled={status === "uploading"}
-                autoFocus={!titleValid}
               />
               {!titleValid && (
                 <p className="text-xs text-muted-foreground">{t("share.titleRequired")}</p>
@@ -580,7 +775,7 @@ export function ShareProjectDialog({
               </p>
             ) : readinessState === "failed" ? (
               <p className="text-xs text-muted-foreground">{t("share.readinessUnavailable")}</p>
-            ) : readiness && readiness.problems.length > 0 ? (
+            ) : remoteProblems.length > 0 ? (
               <div role="status" className="space-y-2 rounded-md border p-3 text-sm">
                 <p className="flex items-center gap-2 font-medium">
                   <TriangleAlert className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
@@ -588,7 +783,7 @@ export function ShareProjectDialog({
                 </p>
                 <p className="text-xs text-muted-foreground">{t("share.readinessNote")}</p>
                 <ul className="max-h-48 space-y-2 overflow-y-auto">
-                  {readiness.problems.map((item) => {
+                  {remoteProblems.map((item) => {
                     const copy = readinessCopyKeys(item);
                     return (
                       <li key={`${item.layerId ?? item.field}:${item.url}`} className="space-y-0.5">
@@ -603,24 +798,59 @@ export function ShareProjectDialog({
                     );
                   })}
                 </ul>
-                {readiness.truncated ? (
+                {readiness?.truncated ? (
                   <p className="text-xs text-muted-foreground">
-                    {t("share.readinessTruncated", {
-                      count: readiness.probeCount,
-                    })}
+                    {t("share.readinessTruncated", { count: readiness?.probeCount ?? 0 })}
                   </p>
                 ) : null}
               </div>
-            ) : readiness && readiness.items.length > 0 ? (
+            ) : remoteItemCount > 0 ? (
               <p className="flex items-center gap-2 text-xs text-muted-foreground">
                 <CircleCheck className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                {t("share.readinessAllReachable", {
-                  count: readiness.items.length,
-                })}
+                {t("share.readinessAllReachable", { count: remoteItemCount })}
               </p>
             ) : null}
 
-            {errorCode === "username-required" ? (
+            {errorCode === "unauthorized" ? (
+              <div
+                role="alert"
+                className="space-y-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive"
+              >
+                <p>
+                  {t(oauthSupported ? "share.reauthBody" : "share.errorUnauthorized", {
+                    shareHost,
+                  })}
+                </p>
+                {oauthSupported ? (
+                  <>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSignIn}
+                      disabled={oauthPending}
+                    >
+                      {oauthPending ? (
+                        <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <LogIn className="me-2 h-3.5 w-3.5" />
+                      )}
+                      {t("share.reauthSignIn")}
+                    </Button>
+                    {oauthError ? (
+                      <p role="alert" className="text-xs text-destructive">
+                        {oauthError}
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <Button type="button" variant="outline" size="sm" onClick={handleConfigureToken}>
+                    <KeyRound className="me-2 h-3.5 w-3.5" />
+                    {t("share.configureToken")}
+                  </Button>
+                )}
+              </div>
+            ) : errorCode === "username-required" ? (
               <div
                 role="alert"
                 className="space-y-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive"
@@ -663,7 +893,7 @@ export function ShareProjectDialog({
                 ) : (
                   <>
                     <Share2 className="me-2 h-3.5 w-3.5" />
-                    {t("share.shareButton")}
+                    {localProblems.length > 0 ? t("share.shareAnyway") : t("share.shareButton")}
                   </>
                 )}
               </Button>

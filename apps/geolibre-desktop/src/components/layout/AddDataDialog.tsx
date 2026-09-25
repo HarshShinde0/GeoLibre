@@ -1,5 +1,5 @@
 import { useAppStore } from "@geolibre/core";
-import type { MapController } from "@geolibre/map";
+import type { MapEngine } from "@geolibre/map";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@geolibre/ui";
 import { Database } from "lucide-react";
 import { useCallback, useMemo, useState, type RefObject } from "react";
@@ -8,19 +8,30 @@ import { AddDataShellProvider } from "./add-data/context";
 import { KIND_I18N_KEY } from "./add-data/constants";
 import { ArcGISSource } from "./add-data/sources/ArcGISSource";
 import { CadSource } from "./add-data/sources/CadSource";
+import { CesiumIonSource } from "./add-data/sources/CesiumIonSource";
+import { CzmlSource } from "./add-data/sources/CzmlSource";
+import { KmlSource } from "./add-data/sources/KmlSource";
+import { LandXmlSource } from "./add-data/sources/LandXmlSource";
 import { DeckVizSource } from "./add-data/sources/DeckVizSource";
 import { DelimitedTextSource } from "./add-data/sources/DelimitedTextSource";
 import { GdbSource } from "./add-data/sources/GdbSource";
 import { GeoRssSource } from "./add-data/sources/GeoRssSource";
 import { GpxSource } from "./add-data/sources/GpxSource";
+import { IcebergSource } from "./add-data/sources/IcebergSource";
+import { RasterSource } from "./add-data/sources/RasterSource";
+import { ZarrSource } from "./add-data/sources/ZarrSource";
+import { PmtilesSource } from "./add-data/sources/PmtilesSource";
 import { MbtilesSource } from "./add-data/sources/MbtilesSource";
 import { OgcFeaturesSource } from "./add-data/sources/OgcFeaturesSource";
 import { OgcVectorTilesSource } from "./add-data/sources/OgcVectorTilesSource";
 import { PhotosSource } from "./add-data/sources/PhotosSource";
+import { PolylineSource } from "./add-data/sources/PolylineSource";
 import { PostgresSource } from "./add-data/sources/PostgresSource";
 import { VideoSource } from "./add-data/sources/VideoSource";
 import { WfsSource } from "./add-data/sources/WfsSource";
+import { WcsSource } from "./add-data/sources/WcsSource";
 import { WmsSource } from "./add-data/sources/WmsSource";
+import { CswSource } from "./add-data/sources/CswSource";
 import { WmtsSource } from "./add-data/sources/WmtsSource";
 import { XyzSource } from "./add-data/sources/XyzSource";
 import type { AddDataKind } from "./add-data/types";
@@ -31,7 +42,7 @@ export type { AddDataKind } from "./add-data/types";
 
 interface AddDataDialogProps {
   kind: AddDataKind | null;
-  mapControllerRef: RefObject<MapController | null>;
+  mapControllerRef: RefObject<MapEngine | null>;
   onOpenChange: (open: boolean) => void;
   /**
    * Deck.gl Layer kind to pre-select when the dialog opens as `deckgl-viz`
@@ -54,6 +65,11 @@ interface AddDataDialogProps {
   initialLayer?: string;
   /** Style document accompanying a deep-linked vector tileset. */
   initialStyleUrl?: string;
+  /** Search term a saved CSW connection was stored with. */
+  initialKeyword?: string;
+  /** Group this dialog session's layers are moved into, when opened via
+   * "Add data to group". */
+  targetGroupId?: string | null;
 }
 
 /**
@@ -68,12 +84,23 @@ function renderSource(
   initialUrl: string | undefined,
   initialLayer: string | undefined,
   initialStyleUrl: string | undefined,
+  initialKeyword: string | undefined,
 ) {
   switch (kind) {
     case "xyz":
       return <XyzSource initialUrl={initialUrl} />;
+    case "cesium-ion":
+      return <CesiumIonSource />;
+    case "czml":
+      return <CzmlSource initialUrl={initialUrl} />;
+    case "kml":
+      return <KmlSource initialUrl={initialUrl} />;
+    case "wcs":
+      return <WcsSource initialUrl={initialUrl} />;
     case "wms":
       return <WmsSource initialUrl={initialUrl} initialLayers={initialLayer} />;
+    case "csw":
+      return <CswSource initialUrl={initialUrl} initialKeyword={initialKeyword} />;
     case "wfs":
       return <WfsSource initialUrl={initialUrl} initialTypeName={initialLayer} />;
     case "wmts":
@@ -90,6 +117,8 @@ function renderSource(
       );
     case "gpx":
       return <GpxSource />;
+    case "landxml":
+      return <LandXmlSource />;
     case "georss":
       return <GeoRssSource />;
     case "delimited-text":
@@ -100,12 +129,22 @@ function renderSource(
       return <GdbSource />;
     case "photos":
       return <PhotosSource />;
+    case "raster":
+      return <RasterSource />;
+    case "zarr":
+      return <ZarrSource />;
+    case "pmtiles":
+      return <PmtilesSource initialUrl={initialUrl} />;
     case "mbtiles":
       return <MbtilesSource />;
+    case "polyline":
+      return <PolylineSource />;
     case "arcgis":
       return <ArcGISSource initialUrl={initialUrl} />;
     case "postgres":
       return <PostgresSource initialPostgres={initialPostgres} />;
+    case "iceberg":
+      return <IcebergSource />;
     case "video":
       return <VideoSource />;
     case "deckgl-viz":
@@ -129,6 +168,8 @@ export function AddDataDialog({
   initialUrl,
   initialLayer,
   initialStyleUrl,
+  initialKeyword,
+  targetGroupId = null,
 }: AddDataDialogProps) {
   const { t } = useTranslation();
   const open = kind !== null;
@@ -137,8 +178,26 @@ export function AddDataDialog({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const martin = useMartinConnection();
 
-  const title = kind ? t(`addData.kind.${KIND_I18N_KEY[kind]}.label`) : t("addData.title");
-  const description = kind ? t(`addData.kind.${KIND_I18N_KEY[kind]}.description`) : "";
+  const nativeGlobe = useAppStore((s) => s.primaryRenderer === "cesium");
+
+  const title =
+    kind === "raster"
+      ? t("toolbar.item.rasterLayer")
+      : kind === "zarr"
+        ? t("toolbar.item.zarrLayer")
+        : kind === "pmtiles"
+          ? t("toolbar.item.pmtilesLayer")
+          : kind
+            ? t(`addData.kind.${KIND_I18N_KEY[kind]}.label`)
+            : t("addData.title");
+  // KML/KMZ is the one kind whose loader differs by renderer: native on the
+  // globe, converted to map layers elsewhere.
+  const description =
+    kind === "kml" && !nativeGlobe
+      ? t("addData.kml.mapDescription")
+      : kind && kind !== "pmtiles" && kind !== "zarr" && kind !== "raster"
+        ? t(`addData.kind.${KIND_I18N_KEY[kind]}.description`)
+        : "";
 
   const closeDialog = useCallback(() => {
     martin.stopTransient();
@@ -163,8 +222,9 @@ export function AddDataDialog({
       setIsSubmitting,
       closeDialog,
       martin,
+      targetGroupId,
     }),
-    [mapControllerRef, addLayer, existingLayers, isSubmitting, closeDialog, martin],
+    [mapControllerRef, addLayer, existingLayers, isSubmitting, closeDialog, martin, targetGroupId],
   );
 
   return (
@@ -187,6 +247,7 @@ export function AddDataDialog({
               initialUrl,
               initialLayer,
               initialStyleUrl,
+              initialKeyword,
             )}
           </AddDataShellProvider>
         ) : null}

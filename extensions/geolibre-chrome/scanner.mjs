@@ -117,6 +117,11 @@ export function scanDocumentForDatasets() {
     if (/\.pmtiles$/.test(path) || says(/pmtiles/)) {
       return { format: "PMTiles", kind: "vector", confidence: 3 };
     }
+    // Before the JSON rule below, which would otherwise hold an EPT `ept.json`
+    // to the spatial-wording test a generic JSON link needs.
+    if (/\.(?:las|laz)$/.test(path) || /\/ept\.json$/.test(path)) {
+      return { format: "LiDAR", kind: "lidar", confidence: 3 };
+    }
     if (/\.(?:tif|tiff|cog)$/.test(path) || says(/geotiff|cloud.?optimized|\bcog\b/)) {
       return { format: "GeoTIFF", kind: "raster", confidence: 3 };
     }
@@ -130,6 +135,14 @@ export function scanDocumentForDatasets() {
     ) {
       return { format: "JSON", kind: "vector", confidence: 1 };
     }
+    // Only after every extension rule, so a `dem.tif` labelled "LiDAR DEM" is
+    // still a raster. Format names only: "lidar" and "point cloud" are the
+    // navigation wording of every elevation portal, and "las" is a common
+    // word. GeoLibre classifies a point cloud from its URL path, so an endpoint
+    // matched by its wording has to carry a `dataType` hint to be opened as one.
+    if (says(/\bcopc\b|\blaz\b|laszip/)) {
+      return { format: "LiDAR", kind: "lidar", confidence: 2, dataType: "lidar" };
+    }
     return says(geoHint)
       ? {
           format: "Data API",
@@ -139,17 +152,36 @@ export function scanDocumentForDatasets() {
       : null;
   };
 
-  const addDataset = (raw, hint = "", label = "", explicitStyle = null) => {
+  const addDataset = (
+    raw,
+    hint = "",
+    label = "",
+    explicitStyle = null,
+    explicitDataType = null,
+  ) => {
     const url = canonicalHttpUrl(raw);
     if (!url) return;
+
+    // Source Cooperative data objects have already been rewritten to the
+    // data.source.coop host by canonicalUrl. Anything left on source.coop is
+    // site navigation, such as `/products?tags=cloud%20optimised%20geotiff`,
+    // whose label can otherwise look like a raster format hint.
+    if (url.hostname === "source.coop") return;
 
     // A page may link to an existing GeoLibre deep link. Unpack it so users can
     // combine its datasets with other links found on the same page.
     const nestedData = url.searchParams.getAll("data");
     if (nestedData.length && /(?:^|\.)geolibre\.app$/i.test(url.hostname)) {
       const nestedStyles = url.searchParams.getAll("style");
+      const nestedDataTypes = url.searchParams.getAll("dataType");
       nestedData.forEach((dataUrl, index) =>
-        addDataset(dataUrl, hint, "", nestedStyles[index] || null),
+        addDataset(
+          dataUrl,
+          hint,
+          "",
+          nestedStyles[index] || null,
+          nestedDataTypes[index]?.trim().toLowerCase() || null,
+        ),
       );
       return;
     }
@@ -160,7 +192,17 @@ export function scanDocumentForDatasets() {
     const onHub = huggingFaceHost(url);
     if (onHub && !huggingFaceFileUrl(url)) return;
 
-    const kind = classify(url, hint);
+    // A GeoLibre link that already says `dataType=lidar` is a point cloud
+    // whatever its path or the wording around it suggests.
+    const kind =
+      explicitDataType === "lidar"
+        ? {
+            format: "LiDAR",
+            kind: "lidar",
+            confidence: 3,
+            ...(classify(url)?.kind === "lidar" ? {} : { dataType: "lidar" }),
+          }
+        : classify(url, hint);
     if (!kind) return;
     const existing = datasets.get(url.href);
     // Hub links carry UI chrome as their text ("Download", "History", "308 kB
@@ -173,6 +215,7 @@ export function scanDocumentForDatasets() {
       kind: kind.kind,
       confidence: kind.confidence,
       styleUrl: canonicalHttpUrl(explicitStyle)?.href ?? existing?.styleUrl ?? null,
+      ...(kind.dataType ? { dataType: kind.dataType } : {}),
     };
     if (!existing || candidate.confidence > existing.confidence) datasets.set(url.href, candidate);
     else if (!existing.styleUrl && candidate.styleUrl) existing.styleUrl = candidate.styleUrl;
@@ -291,4 +334,25 @@ export function scanDocumentForDatasets() {
       (left, right) => right.confidence - left.confidence || left.name.localeCompare(right.name),
     )
     .map(({ confidence: _confidence, ...dataset }) => dataset);
+}
+
+/**
+ * Read back the URLs this document has already requested. A map fetches its
+ * tiles and service documents from JavaScript, so they are never links in the
+ * page and `scanDocumentForDatasets` cannot see them; the Resource Timing
+ * buffer is the record of them that the page keeps on its own behalf.
+ *
+ * Keep every helper inside this function: Chrome serializes it when it injects
+ * it into the active tab, so it cannot close over module-level values.
+ */
+export function collectRequestedUrls() {
+  try {
+    return performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .filter((name) => name.startsWith("http:") || name.startsWith("https:"));
+  } catch {
+    // A document that denies the timing API leaves only its links to scan.
+    return [];
+  }
 }

@@ -1,11 +1,12 @@
 // @refresh reset
-import { useAppStore, type GeoLibreLayer } from "@geolibre/core";
+import { localFileName, useAppStore, type GeoLibreLayer } from "@geolibre/core";
 import type { FeatureCollection } from "geojson";
-import type { MapController, MapDiagnosticEvent } from "@geolibre/map";
+import type { MapDiagnosticEvent, MapEngine } from "@geolibre/map";
 import { getLayerBounds, MapCanvas, setExternalDeckLayerOrderHandler } from "@geolibre/map";
 import { useTranslation } from "react-i18next";
 import {
   addRasterToMap,
+  addVectorFileToMap,
   prepareRasterControl,
   applyRasterLayerOrder,
   applyStacSearchLayerOrder,
@@ -15,6 +16,8 @@ import {
   endLayerGeometryEdit,
   GEO_EDITOR_PLUGIN_ID,
   getGeometryEditTargetLayerId,
+  isPluginEngineSupported,
+  maplibreGeoEditorPlugin,
   openRasterLayerPanel,
   getRightPanel,
   restoreDeckViz,
@@ -23,10 +26,12 @@ import {
   REVERSE_GEOCODE_PLUGIN_ID,
   restoreEffects,
   restoreLidarLayers,
+  restoreArcgisZarrLayers,
   restorePlanetaryComputerLayers,
   reattachSun,
   reattachRouteAnimation,
   reattachFlightSimulator,
+  reattachGodsEyeView,
   restoreArcGISViewportLayers,
   restoreRasterLayers,
   restoreThreeDTilesLayers,
@@ -36,6 +41,7 @@ import {
   setLocalRasterPicker,
   setNonTiledRasterHandler,
   setKmlFileImportHandler,
+  setTerrainMeasureBodyNames,
   setTerrainMeasureLabels,
   setViewStateLabels,
   startLayerGeometryEdit,
@@ -59,6 +65,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -66,6 +73,7 @@ import {
 import { createPortal } from "react-dom";
 import { BROWSER_PANEL_ID, useRegisterBrowserPanel } from "../../hooks/useRegisterBrowserPanel";
 import { COMMENTS_PANEL_ID, useRegisterCommentsPanel } from "../../hooks/useRegisterCommentsPanel";
+import { UrlLoadErrorBanner } from "./UrlLoadErrorBanner";
 import { CommentsPanel } from "../comments/CommentsPanel";
 import { CommentMapOverlay } from "../comments/CommentMapOverlay";
 import { useCommentTool } from "../comments/useCommentTool";
@@ -74,8 +82,10 @@ import { openRightPanel } from "@geolibre/plugins";
 import { getIsMobileViewport } from "../../hooks/useIsMobileViewport";
 import { useProjectFileActions } from "../../hooks/useProjectFileActions";
 import { useProjectHistory } from "../../hooks/useProjectHistory";
+import { useScreenshotReadiness } from "../../hooks/useScreenshotReadiness";
 import {
   isRasterFileName,
+  isGeoLibreProjectFileName,
   isTauri,
   loadDroppedPhotoFiles,
   loadDroppedPhotoPaths,
@@ -88,9 +98,13 @@ import {
   isLoadedModel,
   loadDroppedVectorFiles,
   loadDroppedVectorPaths,
+  readLocalFileText,
+  readLocalFileBytes,
   type DroppedRaster,
 } from "../../lib/tauri-io";
+import { importGeoPackageDrops } from "../../lib/geopackage-drop";
 import { buildKmlModelLayer } from "../../lib/kml-model-layer";
+import { PLANET_SWITCHER_LABEL_KEYS } from "../../lib/planet-labels";
 import { isPhotoDropFileName, type GeotaggedPhotoResult } from "../../lib/geotagged-photos";
 import type { LargeVectorDataset } from "../../lib/duckdb-vector-guard";
 import { detectNonGeographicCoordinates } from "@geolibre/core";
@@ -105,6 +119,7 @@ import {
   OSM_PBF_SIZE_WARN_BYTES,
 } from "../../lib/osm-pbf-loader";
 import { restoreLocalFileLayers } from "../../lib/restore-local-layers";
+import { listenForNativeProjectOpen } from "../../lib/native-project-open";
 import {
   createAppAPI,
   getPluginManager,
@@ -123,8 +138,12 @@ import { wikipediaLang } from "../../lib/knowledge";
 import { registerXyzTileProtocol } from "../../lib/xyz-url";
 import { useEmbedBridge } from "../../hooks/useEmbedBridge";
 import { useRasterIdentify } from "../../hooks/useRasterIdentify";
+import { useGlobalRasterIdentify } from "../../hooks/useGlobalRasterIdentify";
 import { useNetcdfIdentify } from "../../hooks/useNetcdfIdentify";
+import { useTerrainRestore } from "../../hooks/useTerrainRestore";
+import { useScriptControlRestore } from "../../hooks/useScriptControlRestore";
 import { useCogSpectralIdentify } from "../../hooks/useCogSpectralIdentify";
+import { useRasterViewportStretch } from "../../hooks/useRasterViewportStretch";
 import {
   useAutoCollapsedPanel,
   useReplaceLayersPanelId,
@@ -151,6 +170,9 @@ import { MapContextMenu } from "./MapContextMenu";
 import { KnowledgeCardPanel, type KnowledgePlace } from "./KnowledgeCardPanel";
 import { KnowledgeCardConsentDialog } from "./KnowledgeCardConsentDialog";
 import { MapGrid } from "./MapGrid";
+import { PrimaryMapboxCanvas } from "./PrimaryMapboxCanvas";
+import { PrimaryArcgisCanvas } from "./PrimaryArcgisCanvas";
+import { PrimaryCesiumCanvas } from "./PrimaryCesiumCanvas";
 import { RemoteCursorsOverlay } from "./RemoteCursorsOverlay";
 import { useCommandBridge } from "../../hooks/useCommandBridge";
 import { useEmbedApi } from "../../hooks/useEmbedApi";
@@ -261,16 +283,30 @@ const VectorToolsDialog = lazy(() =>
     }),
 );
 
-const ModelBuilderDialog = lazy(() =>
-  import("../processing/ModelBuilderDialog")
+const BatchToolsDialog = lazy(() =>
+  import("../processing/BatchToolsDialog")
     .then((module) => ({
-      default: module.ModelBuilderDialog,
+      default: module.BatchToolsDialog,
     }))
     .catch((error) => {
       // Same chunk-load fallback rationale as ProcessingDialog above.
-      console.error("Failed to load ModelBuilderDialog", error);
+      console.error("Failed to load BatchToolsDialog", error);
       const Fallback = (() =>
-        null) as unknown as typeof import("../processing/ModelBuilderDialog").ModelBuilderDialog;
+        null) as unknown as typeof import("../processing/BatchToolsDialog").BatchToolsDialog;
+      return { default: Fallback };
+    }),
+);
+
+const ModelBuilderPanel = lazy(() =>
+  import("../processing/model-builder/ModelBuilderPanel")
+    .then((module) => ({
+      default: module.ModelBuilderPanel,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load ModelBuilderPanel", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/model-builder/ModelBuilderPanel").ModelBuilderPanel;
       return { default: Fallback };
     }),
 );
@@ -497,7 +533,7 @@ function hasDroppedFiles(event: DragEvent<HTMLElement>): boolean {
 }
 
 function fileNameFromPath(path: string): string {
-  return path.split(/[/\\]/).pop() ?? path;
+  return localFileName(path);
 }
 
 function layerNameFromPath(path: string): string {
@@ -548,6 +584,32 @@ export function DesktopShell({
   onMapReady,
 }: DesktopShellProps) {
   const { t } = useTranslation();
+  const identifyRasterLayerAt = useGlobalRasterIdentify();
+  const identifyAllLabels = useMemo(
+    () => ({
+      title: (count: number) => t("map.identifyAll.title", { count }),
+      resultCount: (count: number) => t("map.identifyAll.resultCount", { count }),
+      featureFallback: (index: number) => t("map.identifyAll.featureFallback", { index }),
+      pixel: t("map.identifyAll.pixel"),
+      expandAll: t("map.identifyAll.expandAll"),
+      collapseAll: t("map.identifyAll.collapseAll"),
+      loadingTitle: t("map.identifyAll.loadingTitle"),
+      loading: t("map.identifyAll.loading"),
+      errorLabel: t("map.identifyAll.errorLabel"),
+      error: t("map.identifyAll.error"),
+      noData: t("map.identifyAll.noData"),
+      pixelReadFailed: t("map.identifyAll.pixelReadFailed"),
+      wmsFailed: t("map.identifyAll.wmsFailed"),
+      photo: {
+        photo: t("map.identifyAll.photo"),
+        noPreview: t("map.identifyAll.photoNoPreview"),
+        viewFullResolution: t("map.identifyAll.photoViewFullResolution"),
+        viewFullscreen: t("map.identifyAll.photoViewFullscreen"),
+        close: t("map.identifyAll.photoClose"),
+      },
+    }),
+    [t],
+  );
   const shellRef = useRef<HTMLDivElement>(null);
   const verticalResizeGuideRef = useRef<HTMLDivElement>(null);
   // Push the translated bookmark labels into the framework-agnostic plugins
@@ -576,7 +638,15 @@ export function DesktopShell({
       partialData: t("terrainMeasure.partialData"),
       heading: t("terrainMeasure.heading"),
       finalHeading: t("terrainMeasure.finalHeading"),
+      bodyNote: t("terrainMeasure.bodyNote"),
     });
+    // The note names the body, so it uses the planet switcher's names rather
+    // than the ellipsoid records' datum-qualified ones.
+    setTerrainMeasureBodyNames(
+      Object.fromEntries(
+        Object.entries(PLANET_SWITCHER_LABEL_KEYS).map(([id, key]) => [id, t(key)]),
+      ),
+    );
   }, [t]);
   // The map's Fullscreen control maximizes the map *canvas* (it calls
   // requestFullscreen on the map container). Chromium promotes that element to
@@ -609,7 +679,7 @@ export function DesktopShell({
   // mid-drag still detaches the global listeners and restores document.body.
   const activeResizeCleanupRef = useRef<(() => void) | null>(null);
   useEffect(() => () => activeResizeCleanupRef.current?.(), []);
-  const mapControllerRef = useRef<MapController | null>(null);
+  const mapControllerRef = useRef<MapEngine | null>(null);
 
   // Frame layers a `?data=` deep link added. Single non-GeoJSON datasets move
   // the camera in their format-specific loader; a repeated `data` batch lists
@@ -662,7 +732,7 @@ export function DesktopShell({
   const handleKnowledgeFlyTo = useCallback((lat: number, lon: number) => {
     mapControllerRef.current?.flyTo({
       center: [lon, lat],
-      zoom: Math.max(mapControllerRef.current?.getMap()?.getZoom() ?? 12, 14),
+      zoom: Math.max(mapControllerRef.current?.readView().zoom ?? 12, 14),
     });
   }, []);
   // The COG/WMS/XYZ layer whose bounding-box subset is being extracted in the
@@ -692,6 +762,8 @@ export function DesktopShell({
   const addImageOverlayLayer = useAppStore((s) => s.addImageOverlayLayer);
   const addTileLayer = useAppStore((s) => s.addTileLayer);
   const addLayerGroup = useAppStore((s) => s.addLayerGroup);
+  const moveLayerGroupToGroup = useAppStore((s) => s.moveLayerGroupToGroup);
+  const moveLayerToGroup = useAppStore((s) => s.moveLayerToGroup);
   const { isActive: isPluginActive, toggle: togglePlugin } = usePluginRegistry();
   const addLayer = useAppStore((s) => s.addLayer);
   const projectGeneration = useAppStore((s) => s.projectGeneration);
@@ -707,6 +779,24 @@ export function DesktopShell({
   // Browser panel, so their "open recent" calls coordinate their aborts (two
   // instances would race). Lifted here for the same reason as `collaboration`.
   const projectFiles = useProjectFileActions(mapControllerRef);
+  const projectFilesRef = useRef(projectFiles);
+  projectFilesRef.current = projectFiles;
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | null = null;
+    void listenForNativeProjectOpen((path) => projectFilesRef.current.handleNativeProjectOpen(path))
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stopListening = unlisten;
+      })
+      .catch((error: unknown) => {
+        console.error("[GeoLibre] Could not listen for opened project files", error);
+      });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
   const notebookOpen = useAppStore((s) => s.ui.notebookOpen);
   const storymapPresenting = useAppStore((s) => s.ui.storymapPresenting);
   // A plugin panel docks at one of four positions beside the Layers/Style
@@ -864,8 +954,12 @@ export function DesktopShell({
   // Live-collaboration session. Owned here (rather than in TopToolbar) so both
   // the Collaborate dialog and the on-canvas status badge share one socket, and
   // so the dialog stays mounted in toolbar-hidden layouts.
-  const collaboration = useCollaboration(mapControllerRef);
-  const commentTool = useCommentTool({ mapControllerRef, collaboration });
+  const collaboration = useCollaboration(mapControllerRef, mapReadyGeneration);
+  const commentTool = useCommentTool({
+    mapControllerRef,
+    collaboration,
+    mapReadyGeneration,
+  });
   const [showResolvedComments, setShowResolvedComments] = useState(false);
   const [selectedCommentId, setSelectedCommentId] = useState<string | null>(null);
   const collaborateDialogOpen = useAppStore((s) => s.ui.collaborateDialogOpen);
@@ -884,11 +978,11 @@ export function DesktopShell({
   useEmbedBridge(mapControllerRef);
   // Request/reply + event channel backing the Python scripting API (live
   // queries, processing, map events). Also inert when not embedded.
-  useCommandBridge(mapControllerRef);
+  useCommandBridge(mapControllerRef, mapReadyGeneration);
   // Runtime postMessage API for a third-party host page that frames the app
   // (fly to a record, highlight it, open a tool; selection/view/tool events back
   // out). Off unless the deployment configured GEOLIBRE_EMBED_ORIGINS.
-  useEmbedApi(mapControllerRef, mapAppAPI);
+  useEmbedApi(mapControllerRef, mapAppAPI, mapReadyGeneration);
   // Same scripting surface, reached over the desktop Jupyter server's relay, so
   // a kernel driven from an EXTERNAL client (VS Code's Jupyter extension) can
   // control the map too. Inert until that server is running.
@@ -898,6 +992,9 @@ export function DesktopShell({
   useRasterIdentify();
   useNetcdfIdentify(mapControllerRef, mapReadyGeneration);
   useCogSpectralIdentify(mapControllerRef, mapReadyGeneration);
+  useRasterViewportStretch(mapControllerRef, mapReadyGeneration);
+  useTerrainRestore(mapControllerRef, mapReadyGeneration, projectGeneration);
+  useScriptControlRestore(mapControllerRef, mapReadyGeneration, projectGeneration);
   const [layerPanelWidth, setLayerPanelWidth] = useState(initialSidePanelWidth);
   const [stylePanelWidth, setStylePanelWidth] = useState(initialSidePanelWidth);
   const [stylePanelOpenRequest, setStylePanelOpenRequest] = useState(0);
@@ -992,30 +1089,35 @@ export function DesktopShell({
         // MapLibre source rather than in `layer.geojson`. Read them back once so
         // the editor has features to load. (Plain geojson layers already have
         // `geojson`.)
+        // The editor draws through a MapLibre or Mapbox map; on another
+        // renderer it cannot start, and waiting for the map will not help.
+        if (
+          !isPluginEngineSupported(maplibreGeoEditorPlugin, useAppStore.getState().primaryRenderer)
+        ) {
+          setDropError(t("renderer.pluginUnsupported"));
+          clearDropMessageLater();
+          return;
+        }
         await ensureLayerGeojsonFromSource(layerId);
         const manager = getPluginManager();
         if (!manager.isActive(GEO_EDITOR_PLUGIN_ID)) {
           manager.activate(GEO_EDITOR_PLUGIN_ID, appAPI);
           if (!manager.isActive(GEO_EDITOR_PLUGIN_ID)) {
-            setDropError(
-              "Could not activate the geometry editor. Try again once the map has fully loaded.",
-            );
+            setDropError(t("layers.editGeometryActivateFailed"));
             clearDropMessageLater();
             return;
           }
         }
         const started = await startLayerGeometryEdit(appAPI, layerId);
         if (!started) {
-          setDropError(
-            "Could not start geometry editing for this layer. Its data may still be loading.",
-          );
+          setDropError(t("layers.editGeometryStartFailed"));
           clearDropMessageLater();
         }
       } finally {
         togglingGeometryEditRef.current = false;
       }
     },
-    [clearDropMessageLater, ensureLayerGeojsonFromSource],
+    [clearDropMessageLater, ensureLayerGeojsonFromSource, t],
   );
 
   const handleCancelGeometryEdit = useCallback(() => {
@@ -1181,22 +1283,155 @@ export function DesktopShell({
     return () => setNonTiledRasterHandler(null);
   }, [t]);
 
+  // A renderer swap restores the plugins from the store's projectPlugins, which
+  // is only refreshed when a plugin is toggled or moved, so it would roll every
+  // plugin back to how it was then (a Time Slider stack added since came back
+  // empty). Refresh it the moment the renderer changes: this store subscriber
+  // runs synchronously inside setPrimaryRenderer, before React unmounts the old
+  // map, so every plugin still reports its live state from a live control.
+  // The project generation whose plugin state has been restored onto a map. A
+  // swap before that restore must not snapshot the manager, which still holds
+  // the previous project's plugins. Likewise the renderer they were restored
+  // onto: a second swap before the new map's restore would read plugins whose
+  // controls are already gone.
+  const restoredPluginGeneration = useRef<number | null>(null);
+  const restoredPluginRenderer = useRef<string | null>(null);
+  // The map engine the plugins were last restored onto.
+  const restoredPluginEngine = useRef<MapEngine | null>(null);
+  useEffect(
+    () =>
+      useAppStore.subscribe((state, previous) => {
+        if (
+          state.primaryRenderer === previous.primaryRenderer ||
+          // A project load brings its own plugin state; never overwrite it.
+          state.projectGeneration !== previous.projectGeneration ||
+          state.projectPlugins !== previous.projectPlugins ||
+          restoredPluginGeneration.current !== state.projectGeneration ||
+          restoredPluginRenderer.current !== previous.primaryRenderer
+        )
+          return;
+        try {
+          const manager = getPluginManager();
+          const stored = state.projectPlugins;
+          const live = manager.getProjectState(stored);
+          // A plugin still registering (an external one loading) is not in
+          // the live snapshot yet; keep what the project stored for it.
+          const registered = new Set(manager.list().map((plugin) => plugin.id));
+          const unregistered = (id: string) => !registered.has(id);
+          const keep = <T,>(record: Record<string, T> | undefined) =>
+            Object.fromEntries(Object.entries(record ?? {}).filter(([id]) => unregistered(id)));
+          const next = {
+            ...live,
+            // Keep every stored activation: a toggle already writes a
+            // deliberate deactivation to the store, so an id still stored but
+            // not live is one that failed to mount (or has not registered)
+            // and should be retried on the new map.
+            activePluginIds: [
+              ...new Set([...live.activePluginIds, ...(stored?.activePluginIds ?? [])]),
+            ],
+            mapControlPositions: {
+              ...keep(stored?.mapControlPositions),
+              ...live.mapControlPositions,
+            },
+            settings: { ...keep(stored?.settings), ...live.settings },
+            manifestUrls: stored?.manifestUrls ?? [],
+          };
+          if (JSON.stringify(next) === JSON.stringify(stored)) return;
+          state.setProjectPlugins(next, false);
+        } catch (error) {
+          console.warn("[GeoLibre] Could not snapshot plugin state for the renderer swap", error);
+        }
+      }),
+    [],
+  );
+
   useEffect(() => {
     // Restoration should run only when a project is loaded (projectGeneration)
     // or the map is reinitialised (mapReadyGeneration), not on every
     // incremental plugin write-back. projectPlugins is read from the store
     // snapshot at call time so it is always current without being a dependency.
-    if (!externalPluginsReady || !mapReadyGeneration || !mapControllerRef.current) return;
+    // Restore compatible plugins for either renderer. Native MapLibre layer
+    // producers remain below their own capability gate.
+    const engine = mapControllerRef.current;
+    if (!externalPluginsReady || !mapReadyGeneration || !engine) return;
     const appAPI = createAppAPI(mapControllerRef);
     const pluginManager = getPluginManager();
-    pluginManager.restoreProjectState(useAppStore.getState().projectPlugins, appAPI);
+    pluginManager.restoreProjectState(useAppStore.getState().projectPlugins, appAPI, {
+      mapReplaced: restoredPluginEngine.current !== null && restoredPluginEngine.current !== engine,
+    });
+    restoredPluginEngine.current = engine;
+    restoredPluginGeneration.current = projectGeneration;
+    restoredPluginRenderer.current = useAppStore.getState().primaryRenderer;
     // Immediately after the restore, so a project that persisted the geo-editor
     // as active cannot re-arm editing inside a read-only viewer embed.
     enforceViewerPlugins();
+    const search = window.location.search;
+    void pluginManager
+      .handleUrlParameters(new URLSearchParams(search), appAPI, `${projectGeneration}:${search}`)
+      // `handleUrlParameters` activates plugins asynchronously, so it can land
+      // after the synchronous pass above. No blocked plugin registers a URL
+      // handler today, but "every activation path is covered" is the whole
+      // point of the guard, so re-assert it once this settles rather than
+      // leaving the next one to notice.
+      .catch(console.error)
+      .finally(enforceViewerPlugins);
+    // The environment plugins have a branch for each renderer (#2287): the
+    // effects engine drives Cesium's sky box and atmosphere, the sun simulation
+    // its lighting and clock, the flight simulator its camera. They rebind the
+    // same way on both — a renderer swap rebuilds the engine, so the host
+    // re-attaches them exactly as it does after a MapLibre re-init.
+    //
+    // activeByDefault plugins are marked active without activate() being
+    // called, so the effects engine must be kicked explicitly to match the
+    // restored active state (idempotent).
+    restoreEffects(
+      appAPI,
+      pluginManager.isActive(EFFECTS_PLUGIN_ID),
+      useAppStore.getState().projectPlugins?.settings?.[EFFECTS_PLUGIN_ID],
+    );
+    // The sun simulation reads/writes native map layers, so it must re-bind to
+    // the (possibly new) map instance after a map re-init or basemap change.
+    // Reattach only — it must NOT derive open/closed state here, which would
+    // reset a locally-opened panel on an unrelated basemap swap or remote edit.
+    // Project loads open/close it via the plugin's applyProjectState (invoked by
+    // restoreProjectState above).
+    reattachSun(appAPI);
+    // The flight simulator holds a reference to the live map (and suspends its
+    // interaction handlers while flying), so rebind it after a map re-init too.
+    reattachFlightSimulator(appAPI);
+    // VectorControl has a Cesium bridge and must restore on either engine.
+    restoreVectorLayers(appAPI);
+    if (engine.kind === "mapbox" || (engine.kind === "arcgis" && engine.capabilities.deckOverlay)) {
+      restoreThreeDTilesLayers(appAPI);
+      void restoreLidarLayers(appAPI).catch(console.error);
+    }
+    // Same contract for the shared deck.gl overlay: re-attach it to the current
+    // map and re-render any deckgl-viz layers a restored project carries. It
+    // binds to either 2D engine (`getMap()` or `getMapboxMap()`), so it sits
+    // above the native-map gate below; on Cesium the plugin manager has
+    // already deactivated the plugin and this only clears its layers.
+    restoreDeckViz(appAPI, pluginManager.isActive(DECK_VIZ_PLUGIN_ID));
+    // The route animation owns native marker/trail layers, so rebind it to the
+    // (possibly new) map after a re-init/basemap swap without deriving
+    // open/closed state (project loads handle that via applyProjectState). It
+    // binds to either 2D engine through getStyleMap, so it sits above the
+    // native-map gate like the deck.gl overlay; on Cesium the plugin manager
+    // has already deactivated it and this only detaches the engine.
+    reattachRouteAnimation(appAPI);
+    // God's Eye View holds the Cesium handle it pushes its CZML feeds at, so it
+    // has to rebind after a renderer swap too. It sits above the native-map gate
+    // because the handle it wants is the globe's, which that gate excludes.
+    // Reattach only — the per-feed toggles come from its applyProjectState.
+    reattachGodsEyeView(appAPI);
+    if (!engine.capabilities.nativeMapInstance) {
+      if (engine.kind === "mapbox" || engine.kind === "arcgis") restoreRasterLayers(appAPI);
+      if (engine.kind === "arcgis") restoreArcgisZarrLayers();
+      void restoreLocalFileLayers();
+      return;
+    }
     restoreThreeDTilesLayers(appAPI);
     restoreRasterLayers(appAPI);
     restorePlanetaryComputerLayers(appAPI);
-    restoreVectorLayers(appAPI);
     // Re-bind saved ArcGIS feature layers to the viewport. Without this a
     // reopened project's layer stays frozen on the extent it was saved with.
     restoreArcGISViewportLayers(appAPI);
@@ -1219,28 +1454,6 @@ export function DesktopShell({
       if (applyStacSearchLayerOrder(layerId, beforeId)) return;
       applyRasterLayerOrder(layerId, beforeId);
     });
-    // activeByDefault plugins are marked active without activate() being
-    // called, so the effects engine must be kicked explicitly to match the
-    // restored active state (idempotent).
-    restoreEffects(
-      appAPI,
-      pluginManager.isActive(EFFECTS_PLUGIN_ID),
-      useAppStore.getState().projectPlugins?.settings?.[EFFECTS_PLUGIN_ID],
-    );
-    // The sun simulation reads/writes native map layers, so it must re-bind to
-    // the (possibly new) map instance after a map re-init or basemap change.
-    // Reattach only — it must NOT derive open/closed state here, which would
-    // reset a locally-opened panel on an unrelated basemap swap or remote edit.
-    // Project loads open/close it via the plugin's applyProjectState (invoked by
-    // restoreProjectState above).
-    reattachSun(appAPI);
-    // The route animation likewise owns native marker/trail layers, so rebind it
-    // to the (possibly new) map after a re-init/basemap swap without deriving
-    // open/closed state (project loads handle that via applyProjectState).
-    reattachRouteAnimation(appAPI);
-    // The flight simulator holds a reference to the live map (and suspends its
-    // interaction handlers while flying), so rebind it after a map re-init too.
-    reattachFlightSimulator(appAPI);
     // Rebind the directions tool to the (possibly new) map instance after a
     // map re-init, since restoreProjectState skips an already-active plugin.
     restoreDirections(appAPI, pluginManager.isActive(DIRECTIONS_PLUGIN_ID));
@@ -1253,19 +1466,6 @@ export function DesktopShell({
       pluginManager.deactivate(REVERSE_GEOCODE_PLUGIN_ID, appAPI);
     }
     restoreReverseGeocode(appAPI, pluginManager.isActive(REVERSE_GEOCODE_PLUGIN_ID));
-    // Same contract for the deck.gl overlay: re-attach it to the current map
-    // and re-render any deckgl-viz layers a restored project carries.
-    restoreDeckViz(appAPI, pluginManager.isActive(DECK_VIZ_PLUGIN_ID));
-    const search = window.location.search;
-    void pluginManager
-      .handleUrlParameters(new URLSearchParams(search), appAPI, `${projectGeneration}:${search}`)
-      // `handleUrlParameters` activates plugins asynchronously, so it can land
-      // after the synchronous pass above. No blocked plugin registers a URL
-      // handler today, but "every activation path is covered" is the whole
-      // point of the guard, so re-assert it once this settles rather than
-      // leaving the next one to notice.
-      .catch(console.error)
-      .finally(enforceViewerPlugins);
   }, [enforceViewerPlugins, externalPluginsReady, mapReadyGeneration, projectGeneration]);
 
   useEffect(() => {
@@ -1280,6 +1480,53 @@ export function DesktopShell({
     setMapReadyGeneration((generation) => generation + 1);
     onMapReady?.(createAppAPI(mapControllerRef));
   }, [onMapReady]);
+
+  /**
+   * Which engine draws the primary map area (issue #2217). `"cesium"` unmounts
+   * `MapCanvas` in favour of the globe, so no `MapController` exists while it is
+   * selected.
+   */
+  const primaryRenderer = useAppStore((s) => s.primaryRenderer);
+  const cesiumPrimary = primaryRenderer === "cesium";
+  useScreenshotReadiness(
+    mapControllerRef,
+    mapReadyGeneration,
+    externalPluginsReady,
+    projectUrlLoadState?.status === "loading" || dataUrlLoadState?.status === "loading",
+    projectUrlLoadState?.error ?? dataUrlLoadState?.error ?? null,
+    primaryRenderer !== "maplibre",
+  );
+  const setObjectDetectionOpen = useAppStore((s) => s.setObjectDetectionOpen);
+  const setSegmentEverythingOpen = useAppStore((s) => s.setSegmentEverythingOpen);
+  // Switching engines swaps which engine the shared ref points at: MapCanvas
+  // unmounts and clears it, then PrimaryCesiumCanvas publishes its CesiumEngine
+  // (and the reverse on the way back). The ref is no longer nulled wholesale
+  // here — that was necessary while only MapLibre implemented the surface, and
+  // it is what left every menu, panel, and shortcut pointing at nothing on the
+  // globe (#2260). Each canvas owns clearing its own engine on unmount, so the
+  // ref is never left aimed at a destroyed map.
+  //
+  // The MapLibre-only panels below still unmount with the 2D map, so any that
+  // were open are closed here. Without this their open flags survive on the
+  // globe and the panel springs back the moment the user returns to 2D, long
+  // after they meant to dismiss it (#2217 review).
+  useEffect(() => {
+    if (primaryRenderer === "maplibre") return;
+    // Bump the readiness generation on the hand-off. It is no longer *reset*
+    // (that is what left every consumer pointing at nothing on the globe), but
+    // the reset did do one useful thing: it forced the generation-gated effects
+    // — viewport history, the embed/notebook/command bridges — to re-run and
+    // detach their listeners from the outgoing MapLibre map. Without a bump
+    // they would not re-run until a new engine published, so a globe that never
+    // becomes ready would leave those closures holding a destroyed map for the
+    // session (#2268 review). Incrementing keeps that cleanup timing while the
+    // ref itself stays live.
+    setMapReadyGeneration((generation) => generation + 1);
+    setRasterSubsetLayer(null);
+    setBasemapExtractOpen(false);
+    setObjectDetectionOpen(false);
+    setSegmentEverythingOpen(false);
+  }, [primaryRenderer, setObjectDetectionOpen, setSegmentEverythingOpen]);
 
   // Keep the on-map compass (reset pitch/bearing) control's tooltip translated.
   // Re-runs when the controller (re)initialises (mapReadyGeneration) and on
@@ -1323,7 +1570,25 @@ export function DesktopShell({
       // Frame ids for each time-animated overlay sequence (keyed by the loader's
       // group marker), so they can be gathered into one layer group afterward.
       const frameGroups = new Map<string, string[]>();
+      // The same for time-tagged KML placemark layers outside any Folder.
+      const placemarkFrameGroups = new Map<string, { name: string; ids: string[] }>();
+      // KML Folder ancestry becomes nested GeoLibre groups. Prefix keys with
+      // the source path so identically named folders from separate files do not
+      // get combined when several files are imported in one batch.
+      const kmlGroups = new Map<string, string>();
+      // GeoJSON layer ids contributed by each source file. A folder-aware KML
+      // splits into one layer per placemark, so the final fit needs every id
+      // from that file to frame the whole import rather than one placemark.
+      const layerIdsBySource = new Map<string, string[]>();
+      // Tracked across every record kind (not just the GeoJSON ones) so a file
+      // whose placemarks are followed by an overlay or model is still
+      // recognized as the last source imported.
+      let lastSourcePath: string | null = null;
+      // Whether any time-tagged KML placemark layer was added, so the Time
+      // Slider opens even when every frame already sits in a KML Folder group.
+      let hasVectorTimeFrames = false;
       for (const layer of importedLayers) {
+        if (layer.path) lastSourcePath = layer.path;
         if (isLoadedKmlSuperOverlay(layer)) {
           lastLayerId = addTileLayer(layer.name || layerNameFromPath(layer.path), {
             tiles: [layer.url],
@@ -1380,17 +1645,64 @@ export function DesktopShell({
           nonGeographic.push(layerName);
           console.warn(
             `[GeoLibre] "${layerName}" declares geographic coordinates but its values are out of range ` +
-              `(max |x| ${Math.round(offRange.maxAbsX).toLocaleString()}, max |y| ${Math.round(offRange.maxAbsY).toLocaleString()} ` +
+              `(max |x| ${Math.round(offRange.maxAbsX).toLocaleString()}, max |y| ${Math.round(
+                offRange.maxAbsY,
+              ).toLocaleString()} ` +
               `over ${offRange.sampled.toLocaleString()} sampled coordinates). The file's CRS is almost certainly ` +
               `mislabelled — reproject it, or correct its .prj/crs, and load it again.`,
           );
         }
         lastLayerId = addGeoJsonLayer(layerName, layer.data, layer.path);
+        // Time-tagged KML placemarks are Time Slider frames, animated through
+        // the same `metadata.timeSpan` visibility toggling as ground overlays.
+        if (layer.timeSpan) {
+          const frameId = lastLayerId;
+          // `addGeoJsonLayer` starts every layer with empty metadata.
+          useAppStore.getState().updateLayer(frameId, {
+            metadata: { timeSpan: layer.timeSpan },
+            ...(layer.visible === false ? { visible: false } : {}),
+          });
+          hasVectorTimeFrames = true;
+          // Frames outside any KML Folder are gathered into one group named
+          // after their file below; foldered frames already sit in their
+          // Folder groups.
+          if (layer.groupId && !layer.groupPath?.length) {
+            const group = placemarkFrameGroups.get(layer.groupId) ?? {
+              name: layerNameFromPath(layer.path),
+              ids: [],
+            };
+            group.ids.push(frameId);
+            placemarkFrameGroups.set(layer.groupId, group);
+          }
+        }
+        if (layer.path) {
+          const sourceIds = layerIdsBySource.get(layer.path) ?? [];
+          sourceIds.push(lastLayerId);
+          layerIdsBySource.set(layer.path, sourceIds);
+        }
+        if (layer.groupPath?.length) {
+          let parentId: string | null = null;
+          const pathParts: string[] = [];
+          for (const folderName of layer.groupPath) {
+            pathParts.push(folderName);
+            const key = `${layer.path}\0${pathParts.join("\0")}`;
+            let groupId = kmlGroups.get(key);
+            if (!groupId) {
+              groupId = addLayerGroup(folderName);
+              if (parentId) moveLayerGroupToGroup(groupId, parentId);
+              kmlGroups.set(key, groupId);
+            }
+            parentId = groupId;
+          }
+          if (parentId) moveLayerToGroup(lastLayerId, parentId);
+        }
       }
 
       setCrsWarning(
         nonGeographic.length > 0
-          ? t("addData.nonGeographicCoordinates", { names: nonGeographic.join(", ") })
+          ? t("addData.nonGeographicCoordinates", {
+              names: nonGeographic.join(", "),
+            })
           : null,
       );
 
@@ -1406,11 +1718,36 @@ export function DesktopShell({
             : t("kml.timeOverlayGroup");
         addLayerGroup(name, ids);
       });
-      const hasTimeAnimation = sequences.length > 0;
+      for (const { name, ids } of placemarkFrameGroups.values()) {
+        if (ids.length > 1) addLayerGroup(name, ids);
+      }
+      const hasTimeAnimation = sequences.length > 0 || hasVectorTimeFrames;
       // Auto-open the Time Slider so a time-animated overlay sequence can be
       // stepped through immediately, without the user hunting for the plugin.
       if (hasTimeAnimation && !isPluginActive(TIME_SLIDER_PLUGIN_ID)) {
         togglePlugin(TIME_SLIDER_PLUGIN_ID, createAppAPI(mapControllerRef));
+      }
+
+      // A folder-aware KML becomes one layer per placemark, so framing the last
+      // layer alone would open on a single point. Combine the extents of every
+      // layer the last source contributed and fit that instead.
+      const sourceLayerIds = lastSourcePath ? (layerIdsBySource.get(lastSourcePath) ?? []) : [];
+      if (sourceLayerIds.length > 1) {
+        const sourceLayerIdSet = new Set(sourceLayerIds);
+        const bounds = useAppStore
+          .getState()
+          .layers.filter((layer) => sourceLayerIdSet.has(layer.id))
+          .map(getLayerBounds)
+          .filter((value): value is [number, number, number, number] => value !== null);
+        if (bounds.length) {
+          mapControllerRef.current?.fitBounds([
+            Math.min(...bounds.map((value) => value[0])),
+            Math.min(...bounds.map((value) => value[1])),
+            Math.max(...bounds.map((value) => value[2])),
+            Math.max(...bounds.map((value) => value[3])),
+          ]);
+          return;
+        }
       }
 
       const importedLayer = useAppStore.getState().layers.find((layer) => layer.id === lastLayerId);
@@ -1440,6 +1777,8 @@ export function DesktopShell({
       addTileLayer,
       addLayer,
       addLayerGroup,
+      moveLayerGroupToGroup,
+      moveLayerToGroup,
       isPluginActive,
       togglePlugin,
       t,
@@ -1462,7 +1801,9 @@ export function DesktopShell({
         // pyramid, which a path-less browser File cannot support.
         const layers =
           paths.length === imports.length
-            ? await loadDroppedVectorPaths(paths, { onLargeDataset: confirmLargeVectorDataset })
+            ? await loadDroppedVectorPaths(paths, {
+                onLargeDataset: confirmLargeVectorDataset,
+              })
             : await loadDroppedVectorFiles(
                 imports.map(({ file }) => file),
                 {
@@ -1548,8 +1889,8 @@ export function DesktopShell({
   );
 
   const finishDrop = useCallback(
-    (importedLayers: ImportedVectorLayer[], rasterCount: number) => {
-      if (!importedLayers.length && !rasterCount) {
+    (importedLayers: ImportedVectorLayer[], rasterCount: number, containerCount = 0) => {
+      if (!importedLayers.length && !rasterCount && !containerCount) {
         throw new Error("Drop a supported vector or raster file.");
       }
       if (importedLayers.length) addImportedVectorLayers(importedLayers);
@@ -1557,7 +1898,7 @@ export function DesktopShell({
       // so the confirmation echoes what the user just added, instead of a bare
       // count that can read like "nothing happened" while the source panel
       // stays open (opengeos/GeoLibre#666).
-      if (importedLayers.length === 1 && !rasterCount) {
+      if (importedLayers.length === 1 && !rasterCount && !containerCount) {
         const only = importedLayers[0];
         // `||` (not `??`) so an empty-string name also falls back to the path.
         setDropMessage(
@@ -1571,19 +1912,20 @@ export function DesktopShell({
       // order and the connector inside the translation catalog. The mixed
       // case composes two independently pluralized noun phrases into its
       // sentence, since one i18next key can pluralize only a single count.
+      const vectorCount = importedLayers.length + containerCount;
       setDropMessage(
-        importedLayers.length && rasterCount
+        vectorCount && rasterCount
           ? t("toolbar.fileDrop.addedBoth", {
               vector: t("toolbar.fileDrop.bothVectorLayers", {
-                count: importedLayers.length,
+                count: vectorCount,
               }),
               raster: t("toolbar.fileDrop.bothRasterLayers", {
                 count: rasterCount,
               }),
             })
-          : importedLayers.length
+          : vectorCount
             ? t("toolbar.fileDrop.addedVectorLayers", {
-                count: importedLayers.length,
+                count: vectorCount,
               })
             : t("toolbar.fileDrop.addedRasterLayers", { count: rasterCount }),
       );
@@ -1594,12 +1936,15 @@ export function DesktopShell({
   // Dropping a file adds a layer to the project, so it belongs with the menus,
   // shortcuts, and command palette the viewer preset switches off — otherwise
   // drag and drop is a way back into authoring that the read-only chrome never
-  // advertises. Both drop paths are gated: the Tauri native listener here and
-  // the webview handlers below.
-  const viewerReadOnly = layoutOptions.viewer;
+  // advertises. A deployment that withheld `data:add` closes the same door for
+  // the same reason: hiding the Add Data menu means nothing if a file dragged
+  // onto the map still loads (issue #1673). Both drop paths are gated: the
+  // Tauri native listener here and the webview handlers below.
+  const deploymentCapabilities = useAppStore((s) => s.deploymentCapabilities);
+  const dropDisabled = layoutOptions.viewer || !deploymentCapabilities.has("data:add");
 
   useEffect(() => {
-    if (!isTauri() || viewerReadOnly) return;
+    if (!isTauri() || dropDisabled) return;
 
     let unlisten: (() => void) | null = null;
     let disposed = false;
@@ -1636,6 +1981,23 @@ export function DesktopShell({
 
           try {
             const paths = event.payload.paths;
+            const projectPaths = paths.filter(isGeoLibreProjectFileName);
+            if (projectPaths.length > 0) {
+              if (!deploymentCapabilities.has("project:edit")) {
+                throw new Error(t("toolbar.error.projectDropNotAllowed"));
+              }
+              if (paths.length !== 1) {
+                throw new Error(t("toolbar.error.multipleProjectDrop"));
+              }
+              const projectPath = projectPaths[0];
+              if (!projectPath) return;
+              await projectFilesRef.current.handleDroppedProject(
+                await readLocalFileText(projectPath),
+                projectPath,
+              );
+              setDropMessage(null);
+              return;
+            }
             // OSM PBF files split into three layers, so they bypass the normal
             // single-FeatureCollection pipeline (which would otherwise route a
             // .pbf to DuckDB ST_Read and merge it).
@@ -1696,7 +2058,9 @@ export function DesktopShell({
                   setDropError(
                     err instanceof OsmPbfTooLargeError
                       ? t("toolbar.error.osmPbfTooLarge")
-                      : `Could not parse ${name}: ${err instanceof Error ? err.message : String(err)}`,
+                      : `Could not parse ${name}: ${
+                          err instanceof Error ? err.message : String(err)
+                        }`,
                   );
                 }
               }
@@ -1716,7 +2080,18 @@ export function DesktopShell({
 
             if (restPaths.length > 0) {
               const rasterCount = await addDroppedRasters(await loadDroppedRasterPaths(restPaths));
-              const importedLayers = await loadDroppedVectorPaths(restPaths, {
+              const containers = await importGeoPackageDrops(restPaths, {
+                readPath: readLocalFileBytes,
+                addFile: (file, sourcePath) =>
+                  addVectorFileToMap(createAppAPI(mapControllerRef), file, {
+                    sourcePath,
+                  }),
+                onError: (name, error) =>
+                  setDropError(
+                    `${name}: ${error instanceof Error ? error.message : String(error)}`,
+                  ),
+              });
+              const importedLayers = await loadDroppedVectorPaths(containers.remaining, {
                 onLargeDataset: confirmLargeVectorDataset,
               });
               // See the browser handler: skip finishDrop's empty-input error
@@ -1726,9 +2101,12 @@ export function DesktopShell({
               if (
                 importedLayers.length > 0 ||
                 rasterCount > 0 ||
-                (pbfPaths.length === 0 && photoResult === null)
+                containers.layerCount > 0 ||
+                (pbfPaths.length === 0 && photoResult === null && containers.count === 0)
               ) {
-                finishDrop(importedLayers, rasterCount);
+                finishDrop(importedLayers, rasterCount, containers.layerCount);
+              } else if (pbfPaths.length === 0 && photoResult === null) {
+                setDropMessage(null);
               }
             }
           } catch (error) {
@@ -1760,44 +2138,53 @@ export function DesktopShell({
     addDroppedRasters,
     addDroppedPhotos,
     addGeoJsonLayer,
-    viewerReadOnly,
+    deploymentCapabilities,
+    dropDisabled,
+    t,
   ]);
 
   const handleDragEnter = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
-      if (viewerReadOnly || !hasDroppedFiles(event)) return;
+      if (dropDisabled || !hasDroppedFiles(event)) return;
       event.preventDefault();
       dragDepthRef.current += 1;
       setIsDraggingFiles(true);
     },
-    [viewerReadOnly],
+    [dropDisabled],
   );
 
   const handleDragOver = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
       // Leaving the default action in place makes the browser refuse the drop,
-      // so the overlay never appears and nothing is imported.
-      if (viewerReadOnly || !hasDroppedFiles(event)) return;
+      // so the overlay never appears and nothing is imported. A drop we will
+      // *not* import still has to be cancelled here, though: the browser's own
+      // default is to navigate the tab to the dropped file, which would take a
+      // viewer or a locked-down kiosk out of the app entirely. Cancel either
+      // way, and say so with the cursor.
+      if (!hasDroppedFiles(event)) return;
       event.preventDefault();
-      event.dataTransfer.dropEffect = "copy";
+      event.dataTransfer.dropEffect = dropDisabled ? "none" : "copy";
     },
-    [viewerReadOnly],
+    [dropDisabled],
   );
 
   const handleDragLeave = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
-      if (viewerReadOnly || !hasDroppedFiles(event)) return;
+      if (dropDisabled || !hasDroppedFiles(event)) return;
       event.preventDefault();
       dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
       if (dragDepthRef.current === 0) setIsDraggingFiles(false);
     },
-    [viewerReadOnly],
+    [dropDisabled],
   );
 
   const handleDrop = useCallback(
     async (event: DragEvent<HTMLDivElement>) => {
-      if (viewerReadOnly || !hasDroppedFiles(event)) return;
+      if (!hasDroppedFiles(event)) return;
+      // Cancel before the capability check, for the same reason as dragover:
+      // an uncancelled drop navigates away from the app.
       event.preventDefault();
+      if (dropDisabled) return;
       dragDepthRef.current = 0;
       setIsDraggingFiles(false);
       setDropError(null);
@@ -1809,6 +2196,20 @@ export function DesktopShell({
 
       try {
         const allFiles = Array.from(event.dataTransfer.files);
+        const projectFilesInDrop = allFiles.filter((file) => isGeoLibreProjectFileName(file.name));
+        if (projectFilesInDrop.length > 0) {
+          if (!deploymentCapabilities.has("project:edit")) {
+            throw new Error(t("toolbar.error.projectDropNotAllowed"));
+          }
+          if (allFiles.length !== 1) {
+            throw new Error(t("toolbar.error.multipleProjectDrop"));
+          }
+          const projectFile = projectFilesInDrop[0];
+          if (!projectFile) return;
+          await projectFilesRef.current.handleDroppedProject(await projectFile.text(), null);
+          setDropMessage(null);
+          return;
+        }
         // OSM PBF files produce three separate layers (points/lines/polygons),
         // so they bypass the single-FeatureCollection vector drop pipeline.
         // Handle them first, then run the rest through the normal pipeline —
@@ -1841,7 +2242,9 @@ export function DesktopShell({
             setDropError(
               err instanceof OsmPbfTooLargeError
                 ? t("toolbar.error.osmPbfTooLarge")
-                : `Could not parse ${file.name}: ${err instanceof Error ? err.message : String(err)}`,
+                : `Could not parse ${file.name}: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`,
             );
             continue;
           }
@@ -1876,7 +2279,18 @@ export function DesktopShell({
 
         if (restFiles.length > 0) {
           const rasterCount = await addDroppedRasters(loadDroppedRasterFiles(restFiles));
-          const importedLayers = await loadDroppedVectorFiles(restFiles, {
+          // Use the Add Data control so containers share its layer picker,
+          // per-table source metadata, and grouped import behavior.
+          const containers = await importGeoPackageDrops(restFiles, {
+            readPath: readLocalFileBytes,
+            addFile: (file, sourcePath) =>
+              addVectorFileToMap(createAppAPI(mapControllerRef), file, {
+                sourcePath,
+              }),
+            onError: (name, error) =>
+              setDropError(`${name}: ${error instanceof Error ? error.message : String(error)}`),
+          });
+          const importedLayers = await loadDroppedVectorFiles(containers.remaining, {
             onLargeDataset: confirmLargeVectorDataset,
           });
           // Call finishDrop (which reports success or throws the empty-input
@@ -1890,9 +2304,12 @@ export function DesktopShell({
           if (
             importedLayers.length > 0 ||
             rasterCount > 0 ||
-            (pbfFiles.length === 0 && photoResult === null)
+            containers.layerCount > 0 ||
+            (pbfFiles.length === 0 && photoResult === null && containers.count === 0)
           ) {
-            finishDrop(importedLayers, rasterCount);
+            finishDrop(importedLayers, rasterCount, containers.layerCount);
+          } else if (pbfFiles.length === 0 && photoResult === null) {
+            setDropMessage(null);
           }
         }
       } catch (error) {
@@ -1908,7 +2325,9 @@ export function DesktopShell({
       addDroppedRasters,
       addDroppedPhotos,
       addGeoJsonLayer,
-      viewerReadOnly,
+      deploymentCapabilities,
+      dropDisabled,
+      t,
     ],
   );
 
@@ -2167,6 +2586,7 @@ export function DesktopShell({
   return (
     <div
       ref={shellRef}
+      data-testid="desktop-shell"
       className="relative flex h-full min-w-0 flex-col overflow-hidden bg-background"
       style={shellStyle}
       onDragEnter={handleDragEnter}
@@ -2283,6 +2703,7 @@ export function DesktopShell({
                   forceBuiltinCollapsed={storymapPresenting}
                   renderBuiltin={({ collapsed, onCollapsedChange }) => (
                     <LayerPanel
+                      themeMode={themeMode}
                       mapControllerRef={mapControllerRef}
                       collaborationApi={collaboration}
                       onResizeStart={startLayerPanelResize}
@@ -2307,9 +2728,13 @@ export function DesktopShell({
             ) : layoutOptions.layerPanelVisible ? (
               <SectionErrorBoundary label="Layer panel" displayName={t("shell.section.layerPanel")}>
                 {layoutOptions.viewer ? (
-                  <ViewerLayerPanel />
+                  <ViewerLayerPanel
+                    mapControllerRef={mapControllerRef}
+                    mapReadyGeneration={mapReadyGeneration}
+                  />
                 ) : (
                   <LayerPanel
+                    themeMode={themeMode}
                     mapControllerRef={mapControllerRef}
                     collaborationApi={collaboration}
                     onResizeStart={startLayerPanelResize}
@@ -2364,20 +2789,95 @@ export function DesktopShell({
             fallbackClassName="h-full w-full"
           >
             <MapGrid>
-              <MapCanvas
-                canUseRemoteElevation={hasElevationConsent}
-                controllerRef={mapControllerRef}
-                onMapDiagnosticEvent={handleMapDiagnosticEvent}
-                onControllerReady={handleMapControllerReady}
+              {/* The primary map area is one renderer or the other (#2217).
+                  Everything below that takes `mapControllerRef` is MapLibre-only
+                  — it drives a `MapController` that the globe does not have — so
+                  it mounts with the 2D map and stays unmounted on the globe,
+                  where `PrimaryCesiumCanvas` explains the absence. Renderer-
+                  neutral, store-driven overlays sit outside the branch and are
+                  available under either engine. */}
+              {primaryRenderer === "mapbox" ? (
+                <PrimaryMapboxCanvas
+                  canUseRemoteElevation={hasElevationConsent}
+                  engineRef={mapControllerRef}
+                  identifyAllLabels={identifyAllLabels}
+                  identifyRasterLayerAt={identifyRasterLayerAt}
+                  onEngineReady={handleMapControllerReady}
+                  onMapDiagnosticEvent={handleMapDiagnosticEvent}
+                />
+              ) : primaryRenderer === "arcgis" ? (
+                <PrimaryArcgisCanvas
+                  canUseRemoteElevation={hasElevationConsent}
+                  engineRef={mapControllerRef}
+                  identifyAllLabels={identifyAllLabels}
+                  identifyRasterLayerAt={identifyRasterLayerAt}
+                  onEngineReady={handleMapControllerReady}
+                  onMapDiagnosticEvent={handleMapDiagnosticEvent}
+                />
+              ) : cesiumPrimary ? (
+                <PrimaryCesiumCanvas
+                  engineRef={mapControllerRef}
+                  onEngineReady={handleMapControllerReady}
+                  onMapDiagnosticEvent={handleMapDiagnosticEvent}
+                />
+              ) : (
+                <>
+                  <MapCanvas
+                    canUseRemoteElevation={hasElevationConsent}
+                    controllerRef={mapControllerRef}
+                    identifyAllLabels={identifyAllLabels}
+                    identifyRasterLayerAt={identifyRasterLayerAt}
+                    onMapDiagnosticEvent={handleMapDiagnosticEvent}
+                    onControllerReady={handleMapControllerReady}
+                  />
+                  <Suspense fallback={null}>
+                    <ObjectDetectionDialog mapControllerRef={mapControllerRef} />
+                  </Suspense>
+                  <Suspense fallback={null}>
+                    <SegmentEverythingPanel mapControllerRef={mapControllerRef} />
+                  </Suspense>
+                </>
+              )}
+              {/* Renderer-neutral: these use the store or `MapEngine`, so they
+                  stay available on every renderer. */}
+              <MapModeBanner mapControllerRef={mapControllerRef} />
+              <PixelTimeSeriesControl
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
               />
-              <RemoteCursorsOverlay mapControllerRef={mapControllerRef} />
+              <NetcdfSampleMarkers
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
+              {/* Its own boundary: the cube window builds a `WebGLRenderer`,
+                  whose constructor throws outright when the browser or driver
+                  gives it no context. Sharing the map's boundary would turn a
+                  failure to draw one panel into the loss of the whole map. */}
+              <SilentErrorBoundary label="NetCDF 3D cube">
+                <NetcdfCubeWindow mapControllerRef={mapControllerRef} />
+              </SilentErrorBoundary>
+              <NetcdfCubeSetupDialog mapControllerRef={mapControllerRef} />
+              <RemoteCursorsOverlay
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
               <CommentMapOverlay
                 mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
                 onSelectComment={(commentId) => {
                   setSelectedCommentId(commentId);
                   openRightPanel(COMMENTS_PANEL_ID);
                 }}
                 showResolved={showResolvedComments}
+              />
+              {/* Isolate the collaboration badge in its own boundary: it renders
+                  over the map, so a fault here must never take down the map. */}
+              <SilentErrorBoundary label="Collaboration status">
+                <CollaborationStatusBadge api={collaboration} mapControllerRef={mapControllerRef} />
+              </SilentErrorBoundary>
+              <MapLegendPanel
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
               />
               <MapContextMenu
                 mapControllerRef={mapControllerRef}
@@ -2390,54 +2890,29 @@ export function DesktopShell({
                 onClose={() => setKnowledgePlace(null)}
                 onFlyTo={handleKnowledgeFlyTo}
               />
-              <BoundsRestrictionIndicator />
-              {/* Isolate the collaboration badge in its own boundary: it renders
-                  over the map, so a fault here must never take down the map
-                  itself (it shares this subtree's error boundary otherwise). */}
-              <SilentErrorBoundary label="Collaboration status">
-                <CollaborationStatusBadge api={collaboration} mapControllerRef={mapControllerRef} />
-              </SilentErrorBoundary>
-              <MapModeBanner mapControllerRef={mapControllerRef} />
-              <QuickAnalysisBanner />
-              <PixelTimeSeriesControl mapControllerRef={mapControllerRef} />
-              <NetcdfSampleMarkers
+              <StoryMapComposeBar
                 mapControllerRef={mapControllerRef}
                 mapReadyGeneration={mapReadyGeneration}
               />
-              <NetcdfProfileWindow />
-              {/* Its own boundary: the cube window builds a `WebGLRenderer`,
-                  whose constructor throws outright when the browser or driver
-                  gives it no context. Sharing the map's boundary would turn a
-                  failure to draw one panel into the loss of the whole map. */}
-              <SilentErrorBoundary label="NetCDF 3D cube">
-                <NetcdfCubeWindow mapControllerRef={mapControllerRef} />
-              </SilentErrorBoundary>
-              <NetcdfCubeSetupDialog mapControllerRef={mapControllerRef} />
-              <MapLegendPanel
-                mapControllerRef={mapControllerRef}
-                mapReadyGeneration={mapReadyGeneration}
-              />
+              <TerrainSettingsDialog mapControllerRef={mapControllerRef} />
               <RasterSubsetPanel
                 layer={rasterSubsetLayer}
                 onClose={() => setRasterSubsetLayer(null)}
                 mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
               />
               <BasemapExtractPanel
                 open={basemapExtractOpen}
                 onClose={() => setBasemapExtractOpen(false)}
                 mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
               />
+              <BoundsRestrictionIndicator />
+              <QuickAnalysisBanner />
+              <NetcdfProfileWindow />
               <Suspense fallback={null}>
                 <StyleManagerPanel />
               </Suspense>
-              <Suspense fallback={null}>
-                <ObjectDetectionDialog mapControllerRef={mapControllerRef} />
-              </Suspense>
-              <Suspense fallback={null}>
-                <SegmentEverythingPanel mapControllerRef={mapControllerRef} />
-              </Suspense>
-              <TerrainSettingsDialog mapControllerRef={mapControllerRef} />
-              <StoryMapComposeBar mapControllerRef={mapControllerRef} />
             </MapGrid>
           </SectionErrorBoundary>
           <SectionErrorBoundary
@@ -2445,6 +2920,25 @@ export function DesktopShell({
             displayName={t("shell.section.pluginFloatingPanels")}
           >
             <FloatingPanels />
+          </SectionErrorBoundary>
+          {/* Mounted inside the map area (like FloatingPanels) so the canvas
+              floats over the map and drag-clamps to it, not to the whole
+              window — the user keeps their layers in view while building. */}
+          <SectionErrorBoundary label="Model Builder" displayName={t("shell.section.modelBuilder")}>
+            <Suspense fallback={null}>
+              <ModelBuilderPanel
+                mapControllerRef={mapControllerRef}
+                onAddRaster={async (bytes, name, fileName) => {
+                  // Same Uint8Array -> BlobPart cast as ProcessingDialog below.
+                  const file = new File([bytes as BlobPart], fileName ?? `${name}.tif`, {
+                    type: "image/tiff",
+                  });
+                  await addRasterToMap(createAppAPI(mapControllerRef), file, {
+                    name,
+                  });
+                }}
+              />
+            </Suspense>
           </SectionErrorBoundary>
           {/* Mounted here (inside the map area, like FloatingPanels) so the
               selection panels anchor to the map canvas's top-left corner and
@@ -2454,7 +2948,7 @@ export function DesktopShell({
             displayName={t("shell.section.selectionPanels")}
           >
             <Suspense fallback={null}>
-              <SelectByExpressionDialog />
+              <SelectByExpressionDialog canEditLayer={collaboration.canEditLayer} />
             </Suspense>
             <Suspense fallback={null}>
               <SelectByLocationDialog />
@@ -2546,6 +3040,7 @@ export function DesktopShell({
                   renderBuiltin={({ collapsed, onCollapsedChange }) => (
                     <StylePanel
                       mapControllerRef={mapControllerRef}
+                      mapReadyGeneration={mapReadyGeneration}
                       onResizeStart={startStylePanelResize}
                       openRequest={stylePanelOpenRequest}
                       collapsed={collapsed}
@@ -2567,6 +3062,7 @@ export function DesktopShell({
               <SectionErrorBoundary label="Style panel" displayName={t("shell.section.stylePanel")}>
                 <StylePanel
                   mapControllerRef={mapControllerRef}
+                  mapReadyGeneration={mapReadyGeneration}
                   onResizeStart={startStylePanelResize}
                   openRequest={stylePanelOpenRequest}
                   autoCollapse={
@@ -2597,6 +3093,7 @@ export function DesktopShell({
               <NotebookPanel
                 onResizeStart={startNotebookPanelResize}
                 mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
                 themeMode={themeMode}
               />
             </Suspense>
@@ -2727,7 +3224,7 @@ export function DesktopShell({
         <NetworkToolsDialog mapControllerRef={mapControllerRef} />
       </Suspense>
       <Suspense fallback={null}>
-        <ModelBuilderDialog mapControllerRef={mapControllerRef} />
+        <BatchToolsDialog mapControllerRef={mapControllerRef} />
       </Suspense>
       <Suspense fallback={null}>
         <StatisticsToolsDialog mapControllerRef={mapControllerRef} />
@@ -2745,7 +3242,10 @@ export function DesktopShell({
         <SegmentationDialog mapControllerRef={mapControllerRef} />
       </Suspense>
       <StoryMapPanel mapControllerRef={mapControllerRef} />
-      <StoryMapPresenter mapControllerRef={mapControllerRef} />
+      <StoryMapPresenter
+        mapControllerRef={mapControllerRef}
+        mapReadyGeneration={mapReadyGeneration}
+      />
       <div
         ref={verticalResizeGuideRef}
         className="pointer-events-none fixed bottom-7 top-11 z-50 hidden w-px bg-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.25)]"
@@ -2763,26 +3263,20 @@ export function DesktopShell({
           </div>
         </div>
       ) : null}
-      {projectUrlLoadState?.error ? (
-        <div
-          aria-live="assertive"
-          className="pointer-events-none absolute left-1/2 top-14 z-50 max-w-[min(90vw,32rem)] -translate-x-1/2 rounded-md border bg-background px-3 py-2 text-center text-sm text-destructive shadow-lg"
-        >
-          {projectUrlLoadState.error}
-        </div>
-      ) : null}
-      {dataUrlLoadState?.error ? (
-        // A link can carry both `url=` and `data=`, and both loaders can fail.
-        // Drop below the project banner so neither message is covered.
-        <div
-          aria-live="assertive"
-          className={`pointer-events-none absolute left-1/2 z-50 max-w-[min(90vw,32rem)] -translate-x-1/2 rounded-md border bg-background px-3 py-2 text-center text-sm text-destructive shadow-lg ${
-            projectUrlLoadState?.error ? "top-28" : "top-14"
-          }`}
-        >
-          {dataUrlLoadState.error}
-        </div>
-      ) : null}
+      <div className="pointer-events-none absolute left-1/2 top-14 z-50 flex w-max max-w-[min(90vw,32rem)] -translate-x-1/2 flex-col gap-2">
+        {projectUrlLoadState?.error ? (
+          <UrlLoadErrorBanner
+            key={`project:${projectUrlLoadState.error}`}
+            message={projectUrlLoadState.error}
+          />
+        ) : null}
+        {dataUrlLoadState?.error ? (
+          <UrlLoadErrorBanner
+            key={`data:${dataUrlLoadState.error}`}
+            message={dataUrlLoadState.error}
+          />
+        ) : null}
+      </div>
       {crsWarning ? (
         <div
           data-testid="crs-warning"

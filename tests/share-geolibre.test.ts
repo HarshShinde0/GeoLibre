@@ -111,6 +111,13 @@ describe("resolveShareBaseUrl", () => {
     assert.equal(resolveShareBaseUrl("http://user:pass@localhost:8000"), null);
   });
 
+  it("refuses query strings and fragments in share base URLs", () => {
+    assert.equal(resolveShareBaseUrl("https://maps.example.org/?tenant=private"), null);
+    assert.equal(resolveShareBaseUrl("https://maps.example.org/#section"), null);
+    assert.equal(resolveShareBaseUrl("https://maps.example.org?"), null);
+    assert.equal(resolveShareBaseUrl("https://maps.example.org#"), null);
+  });
+
   it('treats "off" as sharing disabled', () => {
     assert.equal(resolveShareBaseUrl("off"), null);
     assert.equal(resolveShareBaseUrl("OFF"), null);
@@ -281,11 +288,14 @@ describe("uploadProjectToShare", () => {
     assert.deepEqual(body.groupIds, ["group-1", "group-2"]);
   });
 
-  it("maps 401 to an invalid-token message", async () => {
+  it("flags 401 with an unauthorized code so the UI prompts re-auth", async () => {
     const { fn } = fakeFetch(401, { error: "Unauthorized" });
     await assert.rejects(
       () => uploadProjectToShare({ ...baseArgs, fetchImpl: fn }),
-      /invalid or expired/i,
+      (err: ShareUploadError) =>
+        err instanceof ShareUploadError &&
+        err.code === "unauthorized" &&
+        err.message === "unauthorized",
     );
   });
 

@@ -4,7 +4,7 @@ GeoLibre's browser build can be embedded in any web page and configured through 
 
 ## The live viewer
 
-The browser build is hosted at `https://web.geolibre.app/`. It is a static site deployed on GitHub Pages that runs entirely in your browser: it has no analytics and no server account, and the data you load is processed client-side. Data leaves your browser only when you add a remote URL or explicitly share a project.
+The browser build is hosted at `https://web.geolibre.app/`. It is a static site deployed on GitHub Pages that runs entirely in your browser: there is no server account, and the data you load is processed client-side. The hosted site counts page visits with Google Analytics, which never sees the data you load (see the [Privacy Policy](../privacy.md#website-analytics)); a copy you host yourself has no analytics at all. Data leaves your browser only when you add a remote URL or explicitly share a project.
 
 Open a public project by passing its `.geolibre.json` URL with the `url` parameter:
 
@@ -16,22 +16,24 @@ A project URL like this comes from **Project → Share**. See [Projects](project
 
 A chrome-free `maponly` embed shows only the map, as in this shared 3D Tiles project:
 
-![Chrome-free maponly embed of a 3D Tiles project](https://data.geolibre.app/images/geolibre-embed-maponly.webp)
+![Chrome-free maponly embed of a 3D Tiles project](https://assets.geolibre.app/images/geolibre-embed-maponly.webp)
 
 ## URL parameters
 
 | Parameter    | Example                                                    | Description                                                                                                                           |
 | ------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `url`        | `url=https://share.geolibre.app/you/project.geolibre.json` | Loads a `.geolibre.json` project from a public URL.                                                                                   |
+| `loading`    | `loading=true` | Exposes screenshot readiness on the document element. Accepts a bare flag, `true`, `1`, `yes`, or `on`; disabled by default. See below. |
 | `data`       | `data=https://assets.geolibre.app/data/places.geojson`     | Loads public GeoJSON, GeoParquet, PMTiles, a COG, or a ZIP/REST response containing multiple GeoJSON files.                           |
 | `style`      | `style=https://assets.geolibre.app/data/sample.style.json` | Applies a GeoLibre/MapLibre vector style or raster-style JSON to the data loaded by `data`.                                            |
-| `layout`     | `layout=viewer`                                            | `viewer` provides read-only chrome: Layers, View, Controls, basemaps, search/identify, and Help, with authoring UI hidden. `compact` is the icon-only full-app layout; `embed` and `iframe` are aliases. |
+| `layout`     | `layout=viewer`                                            | `viewer` provides read-only chrome: Layers, View, Controls, basemaps, search/identify, Help, and any quick filters the project's layers carry, with authoring UI hidden. `compact` is the icon-only full-app layout; `embed` and `iframe` are aliases. |
 | `toolbar`    | `toolbar=none`                                             | Hides the top toolbar while keeping panels and the status bar. Use `icons` for icon-only buttons; `icon` and `icon-only` are aliases. `hidden`, `hide`, and `off` are aliases for `none`. |
 | `panels`     | `panels=collapsed`                                         | Starts Layers and Style collapsed to their icon rails. Use `none` to hide all panels; `hidden`, `hide`, and `off` are aliases.         |
 | `hidePanels` | `hidePanels=true`                                          | Alternative way to hide those panels.                                                                                                 |
 | `maponly`    | `maponly`                                                  | Hides all chrome (toolbar, panels, and status bar), leaving only the map. The bare flag or `true`, `1`, `yes`, `on` enable it.        |
 | `welcome`    | `welcome=0`                                                | Hides the first-launch welcome wizard. Accepts `0`, `false`, `off`, or `no`. A `url=` or `data=` deep link already suppresses it automatically. |
 | `theme`      | `theme=dark`                                               | Sets the initial color theme, overriding the OS preference. Accepts `dark` or `light`; the in-app toggle still works afterward.       |
+| `settingsUrl` | `settingsUrl=https://example.com/desktop-settings.json`   | Loads shared presentation settings before the first render. Supports `language`, `layout`, accent `theme`, and `uiProfile`. The override lasts for this page only and does not replace locally saved settings. `settingUrl` is accepted as an alias. |
 | `tool`       | `tool=adaptive_filter`                                     | Opens the Processing (Whitebox toolbox) dialog on a specific tool by its id. Unknown ids open the dialog without preselecting a tool. |
 
 !!! note "Private projects and data"
@@ -47,6 +49,20 @@ Parameters combine. For a narrow, chrome-free, dark embed of a shared project:
 ```text
 https://web.geolibre.app/?url=https://share.geolibre.app/you/project.geolibre.json&maponly&theme=dark
 ```
+
+The settings document must be public or same-origin, return valid JSON, and
+allow cross-origin browser requests when hosted elsewhere. Its supported fields
+use the same shape as their counterparts in the `geolibre.desktopSettings`
+local-storage value. Credential-bearing fields, plugin sources, local startup
+paths, and update settings are ignored. Missing or invalid fields are replaced
+with GeoLibre defaults. If the document fails to load within ten seconds,
+GeoLibre starts with the visitor's local settings. The `locale` and `lang` URL
+parameters take precedence over a shared `language`. Other embed parameters,
+including `theme`, `layout`, and `maponly`, independently control the initial
+light/dark mode and chrome rather than the desktop accent and panel preferences.
+
+Encode the settings URL with `encodeURIComponent` when it contains `&`, `+`,
+`%`, or `#`, just as for a nested `data` URL.
 
 ### Deep-linking a Processing tool
 
@@ -69,6 +85,59 @@ doesn't expose (WASM in the browser, the Python sidecar on desktop) likewise
 isn't preselected. Tool ids match the Processing menu — the same ids used across
 the [Whitebox toolbox](processing.md).
 
+## Waiting for a screenshot
+
+Add `&loading=true` to a project link to enable a machine-readable readiness
+signal without adding a visible overlay to the screenshot:
+
+```text
+https://web.geolibre.app/?url=https://share.geolibre.app/giswqs/national-land-cover-database-nlcd.geolibre.json&maponly&loading=true
+```
+
+The `<html>` element exposes three attributes:
+
+| Attribute | Value |
+| --- | --- |
+| `data-geolibre-load-state` | `loading`, `ready`, or `error` |
+| `data-geolibre-load-pending` | JSON array of pending layer names (or initialization work) |
+| `data-geolibre-load-errors` | JSON array of failure messages |
+
+`ready` means the project/data URL has loaded, visible layers have attached,
+their current-viewport tiles have loaded, the camera has stopped, and browser
+fonts have loaded. These checks must remain satisfied for 500 ms across animation
+frames. Changing the view or layers returns the signal to `loading`. Hidden
+layers (including hidden groups), fully transparent layers, and layers outside
+their zoom range do not block readiness. This does not download an entire
+dataset or tiles outside the viewport.
+
+The check supports native MapLibre layers, the raster control's COG layers, and
+deck.gl visualization layers, including their shared deck.gl renderer. Custom
+renderers without a readiness probe, such as Cesium, LiDAR, Zarr, splats, and
+video, report an explicit error instead of assuming they are ready. A map or
+tile failure the map recovers from does not block `ready`; one it never
+recovers from is reported alongside the timeout, as is any loading that does
+not settle within 120 seconds. Check the
+errors before capturing; neither the embed API's `ready` event nor a browser's
+`networkidle` state establishes this rendering readiness.
+
+For example, with Playwright:
+
+```javascript
+await page.setViewportSize({ width: 1600, height: 1000 });
+await page.goto(projectLink + "&maponly&loading=true");
+await page.waitForFunction(
+  () => ["ready", "error"].includes(document.documentElement.dataset.geolibreLoadState),
+  undefined,
+  { timeout: 150_000 },
+);
+const result = await page.evaluate(() => ({
+  state: document.documentElement.dataset.geolibreLoadState,
+  errors: JSON.parse(document.documentElement.dataset.geolibreLoadErrors || "[]"),
+}));
+if (result.state !== "ready") throw new Error(result.errors.join("; "));
+await page.screenshot({ path: "map.png" });
+```
+
 ## Embedding in a page
 
 Drop the viewer into an `<iframe>`:
@@ -88,7 +157,9 @@ Drop the viewer into an `<iframe>`:
 Use `toolbar=none` to hide the top toolbar while retaining the configured side
 panels and status bar. Use `layout=viewer` for a read-only map with layer toggles, search/identify, and
 basemap switching. Its layer list mirrors the authoring Layers panel, folders
-and all, so group names carry over. The Controls menu is part of the viewer
+and all, so group names carry over, and a layer that carries
+[quick filters](styling.md#quick-filters) shows them below its row so the map
+can be questioned as well as read. The Controls menu is part of the viewer
 chrome, minus the two entries that write to the project (Field Collection and
 GPS Tracking); Record Tour and Record Video only read the map, so they stay.
 Read-only covers the keyboard too: the
@@ -105,7 +176,7 @@ toolbar in a smaller space, or `maponly` for a pure map.
 
 ## Open remote data
 
-Use `data` to open public GeoJSON, GeoParquet, PMTiles, Cloud-Optimized GeoTIFF (COG), or a ZIP archive containing one or more `.geojson`/`.json` FeatureCollections. Each GeoJSON file in a ZIP becomes a separate layer. An optional `style` URL applies Mapbox/MapLibre style JSON to vector data:
+Use `data` to open public GeoJSON, GeoParquet, PMTiles, Cloud-Optimized GeoTIFF (COG), a LiDAR point cloud (LAS, LAZ, COPC, or an EPT `ept.json`), or a ZIP archive containing one or more `.geojson`/`.json` FeatureCollections. Each GeoJSON file in a ZIP becomes a separate layer. An optional `style` URL applies Mapbox/MapLibre style JSON to vector data:
 
 ```text
 https://web.geolibre.app/?data=https://assets.geolibre.app/data/places.geojson&style=https://assets.geolibre.app/data/sample.style.json
@@ -154,7 +225,19 @@ A public DEM COG can be tested directly:
 https://web.geolibre.app/?data=https://data.source.coop/giswqs/opengeos/dem.tif
 ```
 
-A plain `https://…` URL can be passed as-is, as above: `:` and `/` are legal in a query value and need no escaping. Encode the nested data and style URLs with `encodeURIComponent` only when they contain a character that would be read as GeoLibre's own query syntax — `&`, `+`, `%`, or `#`. A bare `=` inside the value is fine, since only the first `=` in each `&`-delimited pair separates the name from the value. Remote servers must permit browser cross-origin requests (CORS). COG, GeoParquet, and PMTiles servers should also support HTTP byte-range requests.
+A LiDAR point cloud opens in the LiDAR layer control. A COPC file (`.copc.laz`) or an EPT dataset (`ept.json`) streams the points in view on demand; a plain LAS or LAZ file is downloaded whole, and is refused if its server reports it larger than 250 MB (convert a larger file to COPC to stream it). A point cloud does not take a `style`:
+
+```text
+https://web.geolibre.app/?data=https://s3.amazonaws.com/hobu-lidar/autzen-classified.copc.laz
+```
+
+GeoLibre recognizes a point cloud from its URL path. An API endpoint whose path has no `.las`/`.laz` suffix, such as `https://api.example.com/download/42?token=…`, needs `dataType=lidar` to say what it returns. Like `style`, `dataType` pairs with `data` by position, so repeat it (leaving earlier values empty) in a batch. A hinted endpoint is downloaded whole, since COPC streaming is chosen only for a `.copc.` URL. An access token passed in the query string is kept on every request, including the byte-range reads of a streamed COPC file; encode the whole `data` value when the endpoint has more than one query parameter:
+
+```text
+https://web.geolibre.app/?data=https%3A%2F%2Fapi.example.com%2Fdownload%2F42%3Ftoken%3Dabc%26expires%3D3600&dataType=lidar
+```
+
+A plain `https://…` URL can be passed as-is, as above: `:` and `/` are legal in a query value and need no escaping. Encode the nested data and style URLs with `encodeURIComponent` only when they contain a character that would be read as GeoLibre's own query syntax — `&`, `+`, `%`, or `#`. A bare `=` inside the value is fine, since only the first `=` in each `&`-delimited pair separates the name from the value. Remote servers must permit browser cross-origin requests (CORS). COG, GeoParquet, PMTiles, and COPC servers should also support HTTP byte-range requests.
 
 For a COG, `style` may point to a raster style JSON object. Supported fields are `mode` (`single`, `rgb`, or `index`), 1-based `bands`, `rescale` ranges, `colormap`, `reversed`, `nodata`, `opacity`, `gamma`, `stretch` (`linear`, `log`, or `sqrt`), and the normalized-difference `index` preset. For example:
 
@@ -182,7 +265,7 @@ For a ZIP containing files of the same geometry type, assign different styles by
 
 You do not need to author that JSON by hand. Open the vector layer's **Layer actions → Styles → Export GeoLibre URL style** menu. The downloaded `.geolibre.style.json` contains only symbology—not feature data—and its render-layer `source` is already set to the original GeoJSON filename stem. Host the file on a CORS-enabled server and pass its URL as `style` alongside the corresponding `data` URL. For a multi-file ZIP, export each layer's GeoLibre URL style and combine their `layers` and `sources` into one style document; layers without `source` can be used for rules shared by every ZIP member.
 
-The same file can be applied interactively to an existing vector layer through **Layer actions → Styles → Import style (GeoLibre URL / Mapbox GL / SLD / QML)…**. Interactive import ignores the file's query-param `source` binding and applies its supported symbology to the layer you selected, so the data filename does not need to match.
+The same file can be applied interactively to an existing vector layer through **Layer actions → Styles → Import style from file (GeoLibre URL / Mapbox GL / SLD / QML)…**. Interactive import ignores the file's query-param `source` binding and applies its supported symbology to the layer you selected, so the data filename does not need to match.
 
 ### An "Open in GeoLibre" badge
 
@@ -276,6 +359,16 @@ Setting the allowlist also narrows the `?embed=1` project/scripting bridges (use
 by the [Python package](../python.md)) to the same origins. As extra hardening
 you can stop other sites from framing the app at all by adding
 `Content-Security-Policy: frame-ancestors <your origins>` at your reverse proxy.
+
+The allowlist decides *who* may send commands. To narrow *which* commands exist
+at all — so a trusted host page still cannot turn the embed into a
+general-purpose data-fetching proxy — build with
+[deployment capabilities](../deployment-capabilities.md). A denied command
+rejects with `Missing <capability> capability` rather than silently doing
+nothing: `loadProject` needs `project:edit`, `addLayer` and `addData` need
+`data:add`, `openTool` needs `processing:run`, and `exportImage` needs
+`export:data`. The rest — `setView`, `highlight`, layer visibility — are
+unprivileged and always available.
 
 ### The typed client
 
@@ -459,3 +552,18 @@ compatible.
 The browser build supports map navigation, browser-selected and URL-based data, styling, the SQL Workspace, and most plugins. Desktop-only features (local file dialogs, local MBTiles and raster reads, project save/open, and the Python sidecar tools) are not available in an embed. See [Getting Started](../getting-started.md).
 
 See the [Sharing & Embedding tutorial](../tutorials/sharing-embedding.md) for a full walkthrough.
+
+## Switching renderers
+
+```javascript
+client.on("rendererchange", ({ renderer }) => console.log(renderer));
+await client.setRenderer("cesium");
+const renderer = await client.getRenderer();
+```
+
+Both methods accept or return `"maplibre"`, `"mapbox"`, `"cesium"`, or
+`"arcgis"`. The change event reports
+the selected renderer. `setRenderer` acknowledges the selection; the new canvas
+mounts asynchronously. Wait for the next `ready` event before issuing camera or
+capture commands. `exportImage()` supports all four renderers and waits for the
+visible layers to settle before returning a PNG data URL.

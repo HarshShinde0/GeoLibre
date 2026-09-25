@@ -12,6 +12,7 @@
 [![Mac App Store](https://img.shields.io/badge/Mac%20App%20Store-GeoLibre-0D96F6?logo=apple&logoColor=white)](https://apps.apple.com/app/geolibre-desktop/id6796848769)
 [![App Store](https://img.shields.io/badge/App%20Store-GeoLibre-0D96F6?logo=appstore&logoColor=white)](https://apps.apple.com/app/geolibre/id6796039674)
 [![Google Play](https://img.shields.io/badge/Google%20Play-GeoLibre-01875F?logo=googleplay&logoColor=white)](https://play.google.com/store/apps/details?id=org.geolibre.app)
+[![Chrome Web Store](https://img.shields.io/badge/Chrome%20Web%20Store-GeoLibre-4285F4?logo=googlechrome&logoColor=white)](https://chromewebstore.google.com/detail/open-data-in-geolibre/joinecgbfoldanidcoakpjgkbaceaooj)
 [![AUR version](https://img.shields.io/aur/version/geolibre-bin?logo=archlinux&label=AUR)](https://aur.archlinux.org/packages/geolibre-bin)
 [![FlatPark](https://img.shields.io/badge/FlatPark-GeoLibre-4A90D9?logo=flatpak)](https://flatpark.org/apps/app.geolibre.GeoLibre/)
 [![image](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -24,16 +25,25 @@ It also ships **1,000+ geoprocessing tools** that run *entirely in your browser*
 
 GeoLibre is built with **Tauri v2**, **React**, **TypeScript**, **MapLibre GL JS**, **DuckDB-WASM Spatial**, and **deck.gl**. The same workspace runs as a native desktop app, native Android and iOS apps, in any modern web browser, and adapts responsively to mobile and small screens.
 
+One project can be viewed through **four rendering engines**: MapLibre GL JS (the
+default), Mapbox GL JS, CesiumJS, or the ArcGIS Maps SDK for JavaScript. Switch
+the primary map from **View → Rendering engine**, or mix engines in synchronized
+split panes, without duplicating the project or its layers. See the
+[rendering-engine guide](https://geolibre.app/user-guide/rendering-engines/) for
+capabilities, credentials, and current compatibility.
+
 - **[Launch GeoLibre Web](https://web.geolibre.app/)** — the full app in your browser, nothing to install
 - **[Download the desktop app](https://geolibre.app/downloads/)** — Windows, macOS, and Linux installers
 - **[Get it on the Mac App Store](https://apps.apple.com/app/geolibre-desktop/id6796848769)** — the sandboxed macOS build
 - **[Get it on the App Store](https://apps.apple.com/app/geolibre/id6796039674)** — the native iOS app for iPhone and iPad
 - **[Get it on Google Play](https://play.google.com/store/apps/details?id=org.geolibre.app)** — the native Android app
+- **[Get the Chrome extension](https://chromewebstore.google.com/detail/open-data-in-geolibre/joinecgbfoldanidcoakpjgkbaceaooj)** — open datasets you find on any webpage in GeoLibre
 - **[Use the Python package](https://geolibre.app/python/)** — embed and control the full app in Jupyter notebooks
 - **[Use the R package](https://r.geolibre.app/)** — build interactive maps in RStudio, Quarto, R Markdown, and Shiny
 - **[1,000+ geoprocessing tools](https://geolibre.app/user-guide/processing/#whitebox-toolbox)** — the full toolbox, in the browser
 - **[Get started](https://geolibre.app/getting-started/)** — install, run from source, and configure
 - **[Features](https://geolibre.app/features/)** — the complete feature list
+- **[Rendering engines](https://geolibre.app/user-guide/rendering-engines/)** — compare MapLibre, Mapbox, Cesium, and ArcGIS and learn how to switch or combine them.
 
 ## Demos
 
@@ -100,7 +110,15 @@ Switch bodies from the planet switcher in the Layers panel. See [Demos](https://
 
 - [GeoLibre 1.0: A Free, Open-Source Cloud-Native GIS That Runs Anywhere (Browser, Desktop & Jupyter)](https://youtu.be/87Cm0QagtxI)
 - [Geoprocessing in the Browser: 700+ Free GIS Tools in GeoLibre, Zero Install](https://youtu.be/W32bIQO_nG8)
+- [Access Free High-Resolution Disaster Satellite Imagery in Your Browser](https://youtu.be/QQ9i5CTNh84)
+- [Regularize Building Footprints in the Browser with GeoLibre](https://youtu.be/xjfPYxgEEEc)
 - [GeoLibre + GeoLens: A Modern GIS Stack for Self-Hosting Geospatial Data](https://youtu.be/kQqgrxXGd4o)
+- [Create Reusable GIS Workflows with GeoLibre Model Builder and AI Assistant](https://youtu.be/dzjNKM6slgs)
+- [Mapping the 2026 Nepal Floods with Free High-Resolution Satellite Imagery](https://youtu.be/UDO1BCwOAAc)
+- [Building Cloud-Native GIS Workflows with GeoLibre](https://youtu.be/RgNoKsvZ5Hk)
+- [Image Georeferencing Using GeoLibre in the Browser](https://youtu.be/lbioujkDSG0)
+
+All of them, with chapters and summaries, are on the [Video Tutorials](https://geolibre.app/tutorials/videos/) page.
 
 ## Geoprocessing: 1,000+ tools, zero install
 

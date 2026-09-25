@@ -11,9 +11,27 @@ import { bundledPlugins } from "./vite-plugins/bundled-plugins";
 import { copyCesiumAssets } from "./vite-plugins/copy-cesium-assets";
 import { copyRtlText } from "./vite-plugins/copy-rtl-text";
 import { copyVectorOps } from "./vite-plugins/copy-vector-ops";
-import { proxyBinaryRequestGuarded } from "./vite-proxy-guard";
+import {
+  proxyAircraftRequestGuarded,
+  proxyAdsbdbAircraftRequestGuarded,
+  proxyBinaryRequestGuarded,
+  proxyAustinCctvFrameRequestGuarded,
+  proxyCalgaryCctvFrameRequestGuarded,
+  proxyCaltransCctvFrameRequestGuarded,
+  proxyCctvCatalogRequestGuarded,
+  proxyCelestrakRequestGuarded,
+  proxyLaunchLibraryRequestGuarded,
+  proxyOverpassRequestGuarded,
+  proxyFirmsRequestGuarded,
+  proxyTransitRequestGuarded,
+  proxyOntarioCctvFrameRequestGuarded,
+  proxyNswCctvFrameRequestGuarded,
+} from "./vite-proxy-guard";
+import { fastPathProxyPlugin } from "./vite-fast-path-proxy";
 
 const GEOAGENT_BROWSER_BUNDLE = "maplibre-gl-geoagent/dist/browser-";
+import { ARCGIS_SDK_HOST, ARCGIS_SDK_VERSION } from "../../packages/map/src/arcgis-sdk";
+
 const EARTH_ENGINE_CONTROL_BUNDLE = "maplibre-gl-earth-engine/dist/";
 const EARTH_ENGINE_BROWSER_BUNDLE = "@google/earthengine/build/browser.js";
 const GIS_CHUNK_WARNING_LIMIT_KB = 14000;
@@ -87,6 +105,18 @@ if (!process.env.VITE_MAPBOX_ACCESS_TOKEN) {
     process.env.MAPBOX_TOKEN || FILE_ENV.VITE_MAPBOX_ACCESS_TOKEN || FILE_ENV.MAPBOX_TOKEN;
   if (mapboxAccessToken) {
     process.env.VITE_MAPBOX_ACCESS_TOKEN = mapboxAccessToken;
+  }
+}
+
+// ArcGIS API key for the ArcGIS renderer's Esri basemap styles: same
+// bare→prefixed bridge. `ARCGIS_API_KEY` from the shell or an .env file is
+// surfaced as `VITE_ARCGIS_API_KEY`; getArcgisApiKey() then lets a runtime
+// Settings override win over this build-time value.
+if (!process.env.VITE_ARCGIS_API_KEY) {
+  const arcgisApiKey =
+    process.env.ARCGIS_API_KEY || FILE_ENV.VITE_ARCGIS_API_KEY || FILE_ENV.ARCGIS_API_KEY;
+  if (arcgisApiKey) {
+    process.env.VITE_ARCGIS_API_KEY = arcgisApiKey;
   }
 }
 
@@ -165,6 +195,193 @@ const PGLITE_CDN = process.env.GEOLIBRE_PGLITE_CDN !== "0";
 // PGlite yet still ships a service worker.
 const IS_EMBED = process.env.GEOLIBRE_EMBED === "1";
 const PWA_DISABLED = IS_TAURI_BUILD || IS_EMBED;
+
+// ---------------------------------------------------------------------------
+// Build-time env exposed to the bundle.
+//
+// A build must never embed a credential belonging to whoever ran it. Two things
+// make that easy to get wrong here:
+//
+//  1. The bare→prefixed bridges above copy `GOOGLE_MAPS_API_KEY`/`MAPBOX_TOKEN`/
+//     `CESIUM_TOKEN` out of the build machine's shell into their `VITE_` names.
+//     Convenient for local testing; it also makes a developer's own environment
+//     build input.
+//  2. Something in the graph reads `import.meta.env` as a WHOLE OBJECT. Vite
+//     cannot tell which keys such a read wants, so it gives up on per-key
+//     replacement and inlines the entire env record — every `VITE_` var set on
+//     the build machine — into every chunk that read reaches.
+//
+// The whole-object read is not ours to delete: `@clerk/shared`'s
+// getEnvVariable.mjs does `import.meta.env[name]` with a computed name, so the
+// inlined record lands in the `ClerkGate-*.js` chunk. The defence therefore
+// cannot be "stop reading the object" — it has to be "there is nothing
+// sensitive in the object to begin with".
+//
+// pruneBuildEnv() enforces that on `process.env`, BEFORE Vite reads it:
+//  1. A `VITE_` var not on BUILD_ENV_KEYS is deleted. An unrecognized var on the
+//     build machine cannot reach the bundle by accident; adding a new one means
+//     adding it here, deliberately.
+//  2. A CREDENTIAL_ENV_KEYS var is blanked in *redistributable* builds. The web
+//     deploy is our own site using our own referrer-restricted keys, so it keeps
+//     them; the Jupyter wheel (GEOLIBRE_EMBED=1) is installed by third parties
+//     and must never carry ours. Blanked rather than deleted so a value in a
+//     `.env` file cannot reintroduce it, and because "" is what every consumer
+//     already treats as unset.
+//
+// Each credential resolves through `getRuntimeEnvironment()`, which overlays
+// `window.__GEOLIBRE_RUNTIME_ENV__` from Settings → Environment variables, so a
+// wheel user supplies their own token at runtime and the affected surfaces
+// degrade as already documented (Mapbox prompts in the basemap API-keys view,
+// the 3D globe is not offered, Protomaps basemaps are hidden).
+//
+// The pruned result is also emitted as `__GEOLIBRE_BUILD_ENV__` for
+// runtime-env.ts, so our own code reads a named allowlist rather than taking a
+// whole-object dependency on `import.meta.env` the way Clerk does.
+//
+// scripts/scan-credentials.mjs verifies the OUTPUT of all this: a build run by
+// hand can satisfy every rule above and still be wrong, so the artifact is
+// checked rather than the configuration.
+// ---------------------------------------------------------------------------
+
+/** Every `VITE_` name the app reads. Anything absent here never reaches the bundle. */
+const BUILD_ENV_KEYS = [
+  "VITE_AMAZON_LOCATION_API_KEY",
+  "VITE_AMAZON_LOCATION_AWS_REGION",
+  "VITE_CESIUM_TOKEN",
+  "VITE_DUCKDB_SPATIAL_EXTENSION_PATH",
+  "VITE_GEE_OAUTH_CLIENT_ID",
+  "VITE_GEE_PROJECT_ID",
+  "VITE_GEOCODER_API_KEY",
+  "VITE_GEOCODER_EMAIL",
+  "VITE_GEOCODER_ENDPOINT",
+  "VITE_GEOCODER_PROVIDER",
+  "VITE_GEOCODER_REVERSE_ENDPOINT",
+  "VITE_GEOLENS_DEFAULT_URL",
+  "VITE_GEOLIBRE_AI_MODEL",
+  "VITE_GEOLIBRE_AI_URL",
+  "VITE_GEOLIBRE_AUTH0_CLIENT_ID",
+  "VITE_GEOLIBRE_AUTH0_DOMAIN",
+  "VITE_GEOLIBRE_CAPABILITIES",
+  "VITE_GEOLIBRE_CLERK_PUBLISHABLE_KEY",
+  "VITE_GEOLIBRE_CLERK_WAITLIST",
+  "VITE_ARCGIS_API_KEY",
+  "VITE_GEOLIBRE_COLLAB_URL",
+  "VITE_GEOLIBRE_EMBED_ORIGINS",
+  "VITE_GEOLIBRE_GA_MEASUREMENT_ID",
+  "VITE_GEOLIBRE_PLUGIN_REGISTRY_URL",
+  "VITE_GEOLIBRE_SHARE_URL",
+  "VITE_GEOLIBRE_VIEWER_URL",
+  "VITE_GOOGLE_MAPS_API_KEY",
+  "VITE_HERE_API_KEY",
+  "VITE_LANGUAGE_PACK_BASE_URL",
+  "VITE_MAPBOX_ACCESS_TOKEN",
+  "VITE_MAPILLARY_ACCESS_TOKEN",
+  "VITE_PROTOMAPS_API_KEY",
+  "VITE_PYODIDE_INDEX_URL",
+  "VITE_ROUTING_ENDPOINT",
+  "VITE_SIDECAR_URL",
+  "VITE_STADIA_API_KEY",
+  "VITE_TIANDITU_API_KEY",
+  "VITE_TOMTOM_API_KEY",
+  "VITE_WELCOME_DISABLED",
+] as const;
+
+// Vars that authenticate as, and bill to, whoever ran the build. Read from the
+// same file the output scanners use, so the name this config strips and the name
+// they look for can never drift apart -- a credential added to only one of two
+// hand-maintained lists is silently uncovered on that side.
+//
+// Public-by-design identifiers (the Clerk *publishable* key, the Auth0 client
+// ID/domain, the GEE OAuth client ID, the GA measurement ID) are deliberately
+// absent from that list: they are meant to ship, and publish-python.yml already
+// injects the GEE client ID.
+const CREDENTIAL_PATTERNS_FILE = path.resolve(CONFIG_DIR, "../../scripts/credential-patterns.json");
+const CREDENTIAL_ENV_KEYS = new Set<string>(
+  (
+    JSON.parse(readFileSync(CREDENTIAL_PATTERNS_FILE, "utf8")) as {
+      credentialEnvNames: string[];
+    }
+  ).credentialEnvNames,
+);
+
+// A build whose output is installed by someone else must not carry our keys.
+// Today that is the Jupyter wheel; `GEOLIBRE_STRIP_CREDENTIALS=1` lets any other
+// redistributable target opt in without another code change.
+const IS_REDISTRIBUTABLE_BUILD = IS_EMBED || process.env.GEOLIBRE_STRIP_CREDENTIALS === "1";
+
+const ALLOWED_BUILD_ENV_KEYS = new Set<string>(BUILD_ENV_KEYS);
+
+/**
+ * Prunes the build env so Vite has nothing sensitive left to inline, then
+ * returns the surviving allowlisted values.
+ *
+ * Must run at module load, before Vite resolves the env for the bundle.
+ *
+ * Covers `.env*` files as well as the shell. Vite resolves `import.meta.env` by
+ * reading the `.env*` files and then letting `process.env` win for any prefixed
+ * key it already holds -- including when that value is `""`. So deleting a key
+ * from `process.env` does NOT suppress a value the file supplies; only writing
+ * `""` over it does. Since `docs/getting-started.md` tells people to configure
+ * most of these keys in `apps/geolibre-desktop/.env.local` and never export
+ * them, a `process.env`-only sweep would miss the common case entirely.
+ *
+ * @returns The allowlisted build-time env for `__GEOLIBRE_BUILD_ENV__`.
+ */
+function pruneBuildEnv(): Record<string, string> {
+  const unknown: string[] = [];
+  const withheld: string[] = [];
+
+  const candidates = new Set(
+    [...Object.keys(process.env), ...Object.keys(FILE_ENV)].filter((key) =>
+      key.startsWith("VITE_"),
+    ),
+  );
+
+  for (const key of candidates) {
+    const fromFile = Boolean(FILE_ENV[key]);
+    if (!ALLOWED_BUILD_ENV_KEYS.has(key)) {
+      delete process.env[key];
+      // A deleted key still resolves from the file, so blank it instead.
+      if (fromFile) process.env[key] = "";
+      unknown.push(key);
+      continue;
+    }
+    if (
+      IS_REDISTRIBUTABLE_BUILD &&
+      CREDENTIAL_ENV_KEYS.has(key) &&
+      (process.env[key] || fromFile)
+    ) {
+      process.env[key] = "";
+      withheld.push(key);
+    }
+  }
+
+  if (unknown.length > 0) {
+    console.info(
+      `[vite] dropped ${unknown.length} unrecognized VITE_ var(s) from the build ` +
+        `(${unknown.join(", ")}). Add the name to BUILD_ENV_KEYS in vite.config.ts to expose it.`,
+    );
+  }
+  if (withheld.length > 0) {
+    console.info(
+      `[vite] redistributable build: withheld ${withheld.length} credential(s) from the ` +
+        `bundle (${withheld.join(", ")}). Users supply their own via ` +
+        "Settings \u2192 Environment variables.",
+    );
+  }
+
+  // Mirror what Vite will resolve: a blanked key stays blank, everything else
+  // falls back to its file value so a `.env.local`-configured var still reaches
+  // getBuildEnvironment() and not just `import.meta.env`.
+  const record: Record<string, string> = {};
+  for (const key of BUILD_ENV_KEYS) {
+    const value = process.env[key] ?? FILE_ENV[key];
+    if (value) record[key] = value;
+  }
+  return record;
+}
+
+const BUILD_ENV = pruneBuildEnv();
 
 // DuckDB-WASM from jsDelivr instead of the build output. Opt-IN, the reverse of
 // PGLITE_CDN above, because DuckDB is on the critical path for opening a local
@@ -302,7 +519,22 @@ function gdal3CdnPaths(): { wasm: string; data: string } | null {
 const GDAL3_CDN_PATHS = gdal3CdnPaths();
 const WMS_PROXY_PATH = "/__geolibre_wms_proxy";
 const WFS_PROXY_PATH = "/__geolibre_wfs_proxy";
+const CSW_PROXY_PATH = "/__geolibre_csw_proxy";
 const GPX_PROXY_PATH = "/__geolibre_gpx_proxy";
+const CELESTRAK_PROXY_PATH = "/__geolibre_celestrak";
+const LAUNCH_LIBRARY_PROXY_PATH = "/launch-library/recent";
+const OPEN_SKY_PROXY_PATH = "/opensky/states";
+const ADSB_LOL_MILITARY_PROXY_PATH = "/adsb-lol/military";
+const ADSBDB_AIRCRAFT_PROXY_PATH = "/adsbdb/aircraft";
+const TRANSIT_PROXY_PATH = "/transit/vehicles";
+const FIRMS_PROXY_PATH = "/firms/viirs";
+const AUSTIN_CCTV_FRAME_PROXY_PATH = "/cctv/austin";
+const CALGARY_CCTV_FRAME_PROXY_PATH = "/cctv/calgary";
+const CCTV_CATALOG_PROXY_PATH = "/cctv/catalog";
+const ONTARIO_CCTV_FRAME_PROXY_PATH = "/cctv/ontario";
+const NSW_CCTV_FRAME_PROXY_PATH = "/cctv/nsw";
+const CALTRANS_CCTV_FRAME_PROXY_PATH = "/cctv/caltrans";
+const OVERPASS_PROXY_PATH = "/overpass";
 const RASTER_PROXY_PATH = "/__geolibre_raster_proxy";
 const DUCKDB_WORKER_PATH_PART = "/@duckdb/duckdb-wasm/dist/";
 const DUCKDB_WORKER_SOURCE_MAP_RE =
@@ -371,14 +603,17 @@ function manualChunks(id: string): string | undefined {
   // generic `maplibre-gl` rule below, which would fold it into the eager
   // `maplibre` chunk and force DuckDB into boot. Give it its own lazy chunk.
   if (id.includes("maplibre-gl-duckdb")) return "maplibre-duckdb";
+  if (id.includes("/mapbox-gl/")) return "mapbox";
   if (id.includes("maplibre-gl")) return "maplibre";
   // Cesium is large (~several MB) and only loads when the user opens the 3D
   // globe view; keep it in its own lazily-fetched chunk, off the boot graph.
-  // `@cesium/engine`/`@cesium/widgets` (which the `cesium` wrapper re-exports)
-  // are only reachable through the lazy `import("cesium")`, so Rollup already
-  // groups them into this chunk; matching them explicitly keeps that intent
-  // even if some future eager import would otherwise pull them onto the boot
-  // graph.
+  // The globe imports `@cesium/engine` directly rather than the `cesium`
+  // wrapper: the wrapper re-exports `@cesium/widgets` too, and that barrel
+  // defeats tree-shaking, so the widget chrome and Knockout shipped in this
+  // chunk even though the pane builds a bare `CesiumWidget`. The `cesium`
+  // package is still a dependency — copy-cesium-assets stages the runtime
+  // Workers/Assets from its prebuilt `Build/Cesium` — so both paths are matched
+  // here, which also keeps the intent if a future eager import appears.
   if (id.includes("/node_modules/cesium/") || id.includes("/node_modules/@cesium/"))
     return "cesium";
   // Returning undefined hands remaining node_modules back to Rollup's default
@@ -439,6 +674,16 @@ function wmsProxyPlugin(): Plugin {
           res.end(message);
         }
       });
+      server.middlewares.use(CSW_PROXY_PATH, async (req, res) => {
+        try {
+          await proxyBinaryRequestGuarded(req, res, CSW_PROXY_PATH);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "CSW proxy request failed";
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end(message);
+        }
+      });
       server.middlewares.use(GPX_PROXY_PATH, async (req, res) => {
         try {
           await proxyBinaryRequestGuarded(req, res, GPX_PROXY_PATH);
@@ -447,6 +692,173 @@ function wmsProxyPlugin(): Plugin {
           res.statusCode = 502;
           res.setHeader("content-type", "text/plain");
           res.end(message);
+        }
+      });
+      server.middlewares.use(CELESTRAK_PROXY_PATH, async (req, res) => {
+        try {
+          await proxyCelestrakRequestGuarded(req, res, CELESTRAK_PROXY_PATH);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("CelesTrak proxy request failed");
+        }
+      });
+      server.middlewares.use(LAUNCH_LIBRARY_PROXY_PATH, async (_req, res) => {
+        try {
+          await proxyLaunchLibraryRequestGuarded(res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Launch Library 2 proxy request failed");
+        }
+      });
+      server.middlewares.use(OPEN_SKY_PROXY_PATH, async (_req, res) => {
+        try {
+          await proxyAircraftRequestGuarded("opensky", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("OpenSky proxy request failed");
+        }
+      });
+      server.middlewares.use(ADSB_LOL_MILITARY_PROXY_PATH, async (_req, res) => {
+        try {
+          await proxyAircraftRequestGuarded("military", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("adsb.lol proxy request failed");
+        }
+      });
+      server.middlewares.use(ADSBDB_AIRCRAFT_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(
+            req.url ?? "",
+            `http://localhost${ADSBDB_AIRCRAFT_PROXY_PATH}`,
+          );
+          const icao = decodeURIComponent(requestUrl.pathname.replace(/^\//, ""));
+          await proxyAdsbdbAircraftRequestGuarded(icao, res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("ADSBDB proxy request failed");
+        }
+      });
+      server.middlewares.use(TRANSIT_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(req.url ?? "", `http://localhost${TRANSIT_PROXY_PATH}`);
+          const feedId = decodeURIComponent(requestUrl.pathname.replace(/^\//, ""));
+          await proxyTransitRequestGuarded(feedId, res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Transit proxy request failed");
+        }
+      });
+      server.middlewares.use(FIRMS_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(req.url ?? "", `http://localhost${FIRMS_PROXY_PATH}`);
+          const satellite = decodeURIComponent(requestUrl.pathname.replace(/^\//, ""));
+          await proxyFirmsRequestGuarded(satellite, res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("NASA FIRMS proxy request failed");
+        }
+      });
+      server.middlewares.use(CALGARY_CCTV_FRAME_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(
+            req.url ?? "",
+            `http://localhost${CALGARY_CCTV_FRAME_PROXY_PATH}`,
+          );
+          const frameId = decodeURIComponent(requestUrl.pathname).match(/^\/(\d{1,4})\.jpg$/)?.[1];
+          await proxyCalgaryCctvFrameRequestGuarded(frameId ?? "", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Calgary CCTV frame request failed");
+        }
+      });
+      server.middlewares.use(AUSTIN_CCTV_FRAME_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(
+            req.url ?? "",
+            `http://localhost${AUSTIN_CCTV_FRAME_PROXY_PATH}`,
+          );
+          const frameId = decodeURIComponent(requestUrl.pathname).match(/^\/(\d{1,4})\.jpg$/)?.[1];
+          await proxyAustinCctvFrameRequestGuarded(frameId ?? "", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Austin CCTV frame request failed");
+        }
+      });
+      server.middlewares.use(CCTV_CATALOG_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(req.url ?? "", `http://localhost${CCTV_CATALOG_PROXY_PATH}`);
+          const provider = decodeURIComponent(requestUrl.pathname).match(
+            /^\/(ontario|drivebc|nsw|caltrans-(?:3|4|7|11))\.json$/,
+          )?.[1];
+          await proxyCctvCatalogRequestGuarded(provider ?? "", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("CCTV catalog request failed");
+        }
+      });
+      server.middlewares.use(ONTARIO_CCTV_FRAME_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(
+            req.url ?? "",
+            `http://localhost${ONTARIO_CCTV_FRAME_PROXY_PATH}`,
+          );
+          const frameId = decodeURIComponent(requestUrl.pathname).match(
+            /^\/([A-Za-z0-9_.-]{1,64})$/,
+          )?.[1];
+          await proxyOntarioCctvFrameRequestGuarded(frameId ?? "", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Ontario CCTV frame request failed");
+        }
+      });
+      server.middlewares.use(NSW_CCTV_FRAME_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(req.url ?? "", `http://localhost${NSW_CCTV_FRAME_PROXY_PATH}`);
+          const frameId = decodeURIComponent(requestUrl.pathname).match(
+            /^\/([a-z0-9_.&-]{1,100}\.(?:jpe?g))$/i,
+          )?.[1];
+          await proxyNswCctvFrameRequestGuarded(frameId ?? "", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("NSW CCTV frame request failed");
+        }
+      });
+      server.middlewares.use(CALTRANS_CCTV_FRAME_PROXY_PATH, async (req, res) => {
+        try {
+          const requestUrl = new URL(
+            req.url ?? "",
+            `http://localhost${CALTRANS_CCTV_FRAME_PROXY_PATH}`,
+          );
+          const match = decodeURIComponent(requestUrl.pathname).match(
+            /^\/(3|4|7|11)\/([a-z0-9-]{1,100})\.jpg$/i,
+          );
+          await proxyCaltransCctvFrameRequestGuarded(match?.[1] ?? "", match?.[2] ?? "", res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Caltrans CCTV frame request failed");
+        }
+      });
+      server.middlewares.use(OVERPASS_PROXY_PATH, async (req, res) => {
+        try {
+          await proxyOverpassRequestGuarded(req, res);
+        } catch {
+          res.statusCode = 502;
+          res.setHeader("content-type", "text/plain");
+          res.end("Overpass proxy request failed");
         }
       });
       server.middlewares.use(RASTER_PROXY_PATH, async (req, res) => {
@@ -734,12 +1146,15 @@ function pwaPlugin(): Plugin[] {
     // MapLibre core (~13 MB) and its feature-plugin chunks. The map boots from
     // its first runtime fetch and is CacheFirst-cached thereafter.
     "**/maplibre-*",
+    "**/mapbox-*",
     "**/duckdb-*",
-    // CesiumJS (~4.8 MB) for the 3D-globe view. Lazily imported only when a pane
+    // CesiumJS (~4.6 MB) for the 3D-globe view. Lazily imported only when a pane
     // switches to the globe, so it is CacheFirst-cached on first use rather than
-    // bloating the app-shell precache. The `Cesium-*` (capital) glob catches the
-    // Rollup facade chunk for the dynamic `import("cesium")` boundary, which the
-    // lowercase glob misses on case-sensitive matchers.
+    // bloating the app-shell precache. The `Cesium-*` (capital) glob covered the
+    // Rollup facade chunk for the old `import("cesium")` boundary; importing
+    // `@cesium/engine` directly no longer emits it, but the glob is kept so a
+    // revert to the wrapper does not silently push a facade chunk into the
+    // precache.
     "**/cesium-*",
     "**/Cesium-*",
     // h5wasm's ~5.6 MB single-file chunk (embedded libhdf5) for the local
@@ -821,7 +1236,9 @@ function pwaPlugin(): Plugin[] {
       // Precache the app shell: HTML plus the JS/CSS/fonts that boot the map.
       // The heavy lazily-fetched chunks/binaries are runtime-cached instead.
       globPatterns: ["**/*.{js,css,html,woff,woff2}"],
-      globIgnores: HEAVY_PRECACHE_IGNORES,
+      // Deployment configuration changes independently of the application build.
+      // Never pin it to a build revision in the service worker.
+      globIgnores: [...HEAVY_PRECACHE_IGNORES, "**/geolibre-runtime-config.js"],
       // deck.gl/vendor shell chunks can run a few MB; allow them into the
       // precache. MapLibre and the huge binaries are globIgnored above.
       maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
@@ -886,6 +1303,24 @@ function pwaPlugin(): Plugin[] {
           },
         },
         {
+          // The ArcGIS Maps SDK for JavaScript, imported per module from Esri's
+          // versioned ES-module CDN by the ArcGIS renderer
+          // (packages/map/src/arcgis-sdk.ts), plus its stylesheet, fonts and
+          // workers from the same versioned prefix. Its own cache, not the
+          // engines' one above: a first load is a few hundred small modules,
+          // enough to evict a previously cached engine from a 400-entry cache
+          // and take it offline. The version is in every path, so a bump mints
+          // new URLs and CacheFirst never serves a stale SDK.
+          urlPattern: ({ url }: { url: URL }) =>
+            url.hostname === ARCGIS_SDK_HOST && url.pathname.startsWith(`/${ARCGIS_SDK_VERSION}/`),
+          handler: "CacheFirst",
+          options: {
+            cacheName: "geolibre-arcgis-sdk",
+            expiration: { maxEntries: 1500, maxAgeSeconds: 60 * 60 * 24 * 30 },
+            cacheableResponse: { statuses: [0, 200] },
+          },
+        },
+        {
           // Basemap tiles/styles from the CORS-friendly default hosts only
           // (OpenFreeMap, CARTO). Other remote tiles/services stay network-only
           // by design — see docs for what is and isn't available offline.
@@ -928,6 +1363,7 @@ export default defineConfig({
     copyCesiumAssets(path.resolve(__dirname, "public/cesium")),
     react(),
     wmsProxyPlugin(),
+    fastPathProxyPlugin(),
     selectiveJsMinifyPlugin(),
     removeJupyterLiteFromTauriDistPlugin(),
     ...pwaPlugin(),
@@ -943,10 +1379,26 @@ export default defineConfig({
     __PGLITE_POSTGIS_CDN_URL__: JSON.stringify(PGLITE_POSTGIS_CDN_URL),
     __CEREUS_WASM_CDN_URL__: JSON.stringify(CEREUS_WASM_CDN_URL),
     __GDAL3_CDN_PATHS__: JSON.stringify(GDAL3_CDN_PATHS),
+    // The allowlisted build-time env (see BUILD_ENV_KEYS). runtime-env.ts reads
+    // this instead of `import.meta.env`, so a whole-object read can no longer
+    // drag every VITE_ var on the build machine into the bundle.
+    __GEOLIBRE_BUILD_ENV__: JSON.stringify(BUILD_ENV),
   },
   server: {
     port: 5173,
     strictPort: true,
+    // Bind the IPv4 loopback explicitly. Vite's default (`localhost`) resolves
+    // through the OS, which on a dual-stack Linux box binds `[::1]` only — so a
+    // reverse proxy dialing `127.0.0.1:5173` (e.g. `tailscale serve`, which
+    // targets IPv4 loopback by default) gets connection-refused and returns
+    // 502. Still loopback-only: this does not expose the dev server on the LAN.
+    host: "127.0.0.1",
+    // Vite rejects requests whose Host header it does not recognise. Reaching
+    // the dev server over Tailscale (`tailscale serve --bg 5173`) forwards the
+    // original `<machine>.<tailnet>.ts.net` Host, which would otherwise be
+    // answered with "Blocked request". `.ts.net` names are only resolvable
+    // inside the tailnet, so allowing them does not widen public exposure.
+    allowedHosts: [".ts.net"],
     watch: {
       // Never watch the Rust side. `tauri dev` runs this dev server as its
       // `beforeDevCommand` and then starts cargo in the same tree, so the
@@ -990,16 +1442,43 @@ export default defineConfig({
       // pre-bundled via the deck.gl-geotiff static import.)
       "proj4",
       "geotiff-geokeys-to-proj4",
+      // cog-tiler-wasm's mask-aware LERC decoder (lerc-decoder.js) reaches
+      // these through dynamic import() the first time a LERC COG opens; they
+      // are geotiff's own codec packages, listed here for the same
+      // discover-and-reload reason as above. The raster loader supplies LERC's
+      // WASM URL explicitly, so its ESM decoder can also be pre-bundled.
+      "lerc",
+      "pako",
+      "zstddec",
       // Cesium (the 3D-globe view). Pre-bundle it up front so esbuild applies
       // CJS→ESM interop to its CommonJS transitive deps (e.g. mersenne-twister,
       // which has no ESM entry): without this, the dev server serves those raw
       // and the `import x from "mersenne-twister"` default import throws. It is
-      // reached only through the lazy `import("cesium")` in CesiumCanvas, so
-      // without pre-bundling Vite would also discover it on first open and do a
-      // full-page reload to re-optimize. Cesium locates its Workers/Assets via
-      // the CESIUM_BASE_URL global (never `import.meta.url`), so pre-bundling
-      // does not mangle any asset reference.
-      "cesium",
+      // reached only through the lazy `import("@cesium/engine")` in
+      // CesiumCanvas, so without pre-bundling Vite would also discover it on
+      // first open and do a full-page reload to re-optimize.
+      //
+      // Pre-bundling is safe for the asset resolution because *this app* always
+      // defines the `CESIUM_BASE_URL` global before importing the engine
+      // (`prepareCesiumEnvironment()` in CesiumCanvas). The engine only derives
+      // a base from `import.meta.url` when that global is undefined
+      // (`buildModuleUrl.js`), and esbuild rewriting the module URL is exactly
+      // what would break that fallback — so dropping the global would make this
+      // entry unsafe, not just the paths wrong.
+      //
+      // This must name the same specifier the globe imports. It used to be the
+      // `cesium` wrapper; that package is still a dependency for its prebuilt
+      // Workers/Assets (see copy-cesium-assets.ts) but nothing imports it as a
+      // module any more, so pre-bundling it would optimize the wrong graph and
+      // leave `@cesium/engine` to be discovered on first open — the full-page
+      // reload this list exists to prevent.
+      "@cesium/engine",
+      // Cesium's toolbar widgets (the globe's home and scene-mode buttons),
+      // reached through a second lazy import in CesiumCanvas's mount effect.
+      // Listed for the same reason as the engine above: without it Vite
+      // discovers the package on first open of the globe and triggers a
+      // full-page reload to re-optimize.
+      "@cesium/widgets",
     ],
     // PGlite ships its own WASM + filesystem bundles and must not be pre-bundled
     // by esbuild, which mangles those asset references (per PGlite's Vite guide).
@@ -1041,6 +1520,14 @@ export default defineConfig({
     sourcemap: !!process.env.TAURI_DEBUG,
     chunkSizeWarningLimit: GIS_CHUNK_WARNING_LIMIT_KB,
     rollupOptions: {
+      // Two pages: the app shell and the standalone OAuth callback. The
+      // callback gets its own entry so its tiny script is compiled through
+      // Vite (base-path-aware asset URLs) instead of shipped as raw inline
+      // HTML; see oauth-callback.html.
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        oauthCallback: path.resolve(__dirname, "oauth-callback.html"),
+      },
       onwarn,
       output: {
         manualChunks,

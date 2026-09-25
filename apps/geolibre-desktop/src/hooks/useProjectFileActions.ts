@@ -1,6 +1,7 @@
 import {
   DEFAULT_PROJECT_NAME,
   detachProjectCopy,
+  parseProject,
   projectFromStore,
   redactProjectCredentials,
   excludeHiddenFieldsFromProject,
@@ -17,6 +18,7 @@ import {
 } from "@geolibre/plugins";
 import type { FeatureCollection } from "geojson";
 import { type FormEvent, useCallback, useLayoutEffect, useRef, useState } from "react";
+import { embedEditedGeometry, hasEditedGeometry } from "../lib/edited-geometry-save";
 import { useTranslation } from "react-i18next";
 import { createAppAPI, getPluginManager } from "./usePlugins";
 import { pluginManifestUrlsForIds } from "../lib/external-plugins";
@@ -45,12 +47,22 @@ import { getShareFetch } from "../lib/share-fetch";
 import {
   resolveShareBaseUrl,
   sharedProjectContentMatches,
+  shareHostLabel,
+  ShareUploadError,
   updateSharedProjectContent,
 } from "../lib/share-geolibre";
+import {
+  resolveShareRequestToken,
+  ShareOAuthError,
+  shareOAuthErrorKey,
+  supportsShareOAuth,
+} from "../lib/share-oauth";
 import { shareAuthorizedFetch } from "../lib/share-gallery";
 import { normalizeProjectUrl } from "../lib/urls";
 import { recordExplicitProjectSave } from "../lib/project-history-session";
 import {
+  canSaveVectorFileReferences,
+  durableVectorDataChoice,
   rememberProjectSaveChoices,
   reusableCredentialChoice,
   reusableVectorDataChoice,
@@ -66,6 +78,8 @@ import {
 } from "../lib/qgis-project-import";
 import { importArcgisProject, type ArcgisProjectImportWarning } from "../lib/arcgis-project-import";
 import type { MapControllerRef } from "../components/layout/toolbar/constants";
+import { IS_MAS_BUILD } from "../lib/build-flags";
+import { resolveDroppedProjectIfCurrent } from "../lib/dropped-project";
 
 /** A pending "strip credentials before saving?" prompt. */
 export interface CredentialStripPrompt {
@@ -73,6 +87,18 @@ export interface CredentialStripPrompt {
   /** Project generation that opened the prompt. */
   projectGeneration: number;
   resolve: (choice: "strip" | "keep" | "cancel") => void;
+}
+
+export interface DroppedProjectPrompt {
+  project: GeoLibreProject;
+  path: string | null;
+  text: string;
+  /** Project generation that opened the prompt. */
+  projectGeneration: number;
+  /** Serialized workspace state covered by the open/discard decision. */
+  projectFingerprint: string | null;
+  /** Monotonic token ensuring the newest accepted drop wins. */
+  operationId: number;
 }
 
 /**
@@ -109,16 +135,20 @@ const SERIALIZATION_TOO_LARGE_PATTERN =
  * otherwise be lost on reopen (the browser exposes no path to re-read them).
  */
 export interface EmbedVectorDataPrompt {
+  /** Whether saving references would lose committed geometry edits. */
+  hasGeometryEdits: boolean;
   /** Number of local-file vector layers that can be embedded. */
   count: number;
   /** Total embedded size in bytes, for the size warning. */
   bytes: number;
   /**
-   * Desktop hosts can save the layers as file references (reloaded from disk on
-   * reopen) instead of embedding, so the "don't embed" choice is labelled and
-   * described differently than on the web (where it discards the data).
+   * Non-sandboxed desktop hosts can save layers as file references (reloaded
+   * from disk on reopen) instead of embedding. Mac App Store builds are desktop
+   * hosts too, but must embed because their file access expires after relaunch.
    */
   desktop: boolean;
+  /** Whether the host can persist a path-only project that survives relaunch. */
+  allowFileReferences: boolean;
   /** Project generation that opened the prompt. */
   projectGeneration: number;
   resolve: (choice: "embed" | "noembed" | "cancel") => void;
@@ -270,6 +300,12 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
   const projectGeneration = useAppStore((s) => s.projectGeneration);
 
   const [actionError, setActionError] = useState<string | null>(null);
+  const [droppedProjectPrompt, setDroppedProjectPrompt] = useState<DroppedProjectPrompt | null>(
+    null,
+  );
+  const [droppedProjectSaving, setDroppedProjectSaving] = useState(false);
+  const droppedProjectPromptRef = useRef<DroppedProjectPrompt | null>(null);
+  const droppedProjectOperationRef = useRef(0);
   const [qgisImportWarnings, setQgisImportWarnings] = useState<QgisProjectImportWarning[] | null>(
     null,
   );
@@ -356,8 +392,14 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     if (saveNamePrompt && saveNamePrompt.projectGeneration !== projectGeneration) {
       settleSaveNamePrompt(saveNamePrompt, null);
     }
+    if (droppedProjectPrompt && droppedProjectPrompt.projectGeneration !== projectGeneration) {
+      droppedProjectPromptRef.current = null;
+      setDroppedProjectPrompt(null);
+      setDroppedProjectSaving(false);
+    }
   }, [
     credentialStripPrompt,
+    droppedProjectPrompt,
     embedVectorDataPrompt,
     projectGeneration,
     saveNamePrompt,
@@ -393,6 +435,123 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
           error instanceof Error ? error.message : t("toolbar.error.couldNotOpenProject"),
         );
       }
+    }
+  };
+
+  const loadDroppedProject = async (candidate: DroppedProjectPrompt) => {
+    return resolveDroppedProjectIfCurrent({
+      project: candidate.project,
+      projectGeneration: candidate.projectGeneration,
+      projectFingerprint: candidate.projectFingerprint,
+      isCurrentOperation: () =>
+        droppedProjectOperationRef.current === candidate.operationId &&
+        useAppStore.getState().projectGeneration === candidate.projectGeneration,
+      getWorkspaceState: () => ({
+        projectGeneration: useAppStore.getState().projectGeneration,
+        isDirty: useAppStore.getState().isDirty,
+        projectFingerprint: useAppStore.getState().isDirty
+          ? serializeProject(projectFromStore(useAppStore.getState()))
+          : null,
+      }),
+      resolveProject: resolveProjectXyzLayers,
+      loadProject: (project) => {
+        loadProject(project, candidate.path, {
+          rememberRecent: isTauri() && candidate.path !== null,
+        });
+        if (candidate.path) rememberStartupProjectSnapshot(candidate.path, candidate.text);
+      },
+      workspaceChanged: (state, project) => {
+        const updated = {
+          ...candidate,
+          project,
+          projectGeneration: state.projectGeneration,
+          projectFingerprint: state.projectFingerprint,
+        };
+        droppedProjectPromptRef.current = updated;
+        setDroppedProjectPrompt(updated);
+      },
+    });
+  };
+
+  /** Parse and open a project supplied by either browser or native drag-and-drop. */
+  const handleDroppedProject = async (text: string, path: string | null): Promise<boolean> => {
+    try {
+      const candidate = {
+        project: parseProject(text),
+        path,
+        text,
+        projectGeneration: useAppStore.getState().projectGeneration,
+        projectFingerprint: useAppStore.getState().isDirty
+          ? serializeProject(projectFromStore(useAppStore.getState()))
+          : null,
+        operationId: ++droppedProjectOperationRef.current,
+      };
+      if (useAppStore.getState().isDirty) {
+        droppedProjectPromptRef.current = candidate;
+        setDroppedProjectPrompt(candidate);
+        return false;
+      }
+      return await loadDroppedProject(candidate);
+    } catch (error) {
+      console.error("Failed to open dropped project", error);
+      setActionError(
+        error instanceof Error ? error.message : t("toolbar.error.couldNotOpenProject"),
+      );
+      return false;
+    }
+  };
+
+  /** Open a project path delivered by the operating system or another app instance. */
+  const handleNativeProjectOpen = async (path: string): Promise<boolean> => {
+    try {
+      const result = await openRecentProjectFile(path);
+      return await handleDroppedProject(result.text, result.path);
+    } catch (error) {
+      console.error("Failed to open native project path", error);
+      setActionError(
+        error instanceof Error ? error.message : t("toolbar.error.couldNotOpenProject"),
+      );
+      return false;
+    }
+  };
+
+  const resolveDroppedProjectPrompt = async (choice: "save" | "discard" | "cancel") => {
+    if (droppedProjectSaving) return;
+    const candidate = droppedProjectPrompt;
+    if (!candidate) return;
+    if (choice === "cancel") {
+      droppedProjectPromptRef.current = null;
+      setDroppedProjectPrompt(null);
+      return;
+    }
+    if (choice === "save") {
+      setDroppedProjectSaving(true);
+      setDroppedProjectPrompt(null);
+      try {
+        if (!(await saveProject())) {
+          if (droppedProjectPromptRef.current === candidate) setDroppedProjectPrompt(candidate);
+          return;
+        }
+      } finally {
+        setDroppedProjectSaving(false);
+      }
+      if (droppedProjectPromptRef.current !== candidate) return;
+    }
+    droppedProjectPromptRef.current = null;
+    setDroppedProjectPrompt(null);
+    const decidedCandidate = {
+      ...candidate,
+      projectFingerprint: useAppStore.getState().isDirty
+        ? serializeProject(projectFromStore(useAppStore.getState()))
+        : null,
+    };
+    try {
+      await loadDroppedProject(decidedCandidate);
+    } catch (error) {
+      console.error("Failed to open dropped project", error);
+      setActionError(
+        error instanceof Error ? error.message : t("toolbar.error.couldNotOpenProject"),
+      );
     }
   };
 
@@ -802,6 +961,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       basemapStyleUrl: state.basemapStyleUrl,
       basemapVisible: state.basemapVisible,
       basemapOpacity: state.basemapOpacity,
+      blankBackgroundColor: state.blankBackgroundColor,
       layers: layersOverride ?? state.layers,
       selectedLayerId: state.selectedLayerId,
       layerGroups: state.layerGroups,
@@ -811,6 +971,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
         manifestUrls: pluginManifestUrls,
       },
       legend: state.legend,
+      printLayout: state.printLayout,
       storymap: state.storymap,
       models: state.models,
       processingHistory: state.processingHistory,
@@ -819,6 +980,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       mapLayout: state.mapLayout,
       secondaryMapViews: state.secondaryMapViews,
       primaryMapLabel: state.primaryMapLabel,
+      primaryRenderer: state.primaryRenderer,
       styleLibrary: state.projectStyleLibrary,
       comments: state.comments,
       metadata: state.metadata,
@@ -883,12 +1045,15 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     bytes: number,
     desktop: boolean,
     promptProjectGeneration: number,
+    hasGeometryEdits: boolean,
   ) =>
     new Promise<"embed" | "noembed" | "cancel">((resolve) => {
       setEmbedVectorDataPrompt({
         count,
+        hasGeometryEdits,
         bytes,
         desktop,
+        allowFileReferences: canSaveVectorFileReferences(desktop, IS_MAS_BUILD),
         projectGeneration: promptProjectGeneration,
         resolve,
       });
@@ -920,6 +1085,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       }
     }
     return layers.map((layer) => {
+      if (hasEditedGeometry(layer)) return embedEditedGeometry(layer);
       let metadata = layer.metadata;
       const collection = embeddable.get(layer.id);
       if (collection) metadata = { ...metadata, embeddedGeoJSON: collection };
@@ -944,7 +1110,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       bytes += encoder.encode(JSON.stringify(collection)).length;
     }
     for (const layer of layers) {
-      if (isReloadableLocalFileLayer(layer) && layer.geojson) {
+      if (!embeddable.has(layer.id) && isReloadableLocalFileLayer(layer) && layer.geojson) {
         bytes += encoder.encode(JSON.stringify(layer.geojson)).length;
       }
     }
@@ -955,13 +1121,22 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
   // be embedded (no filesystem path), so the prompt offers Embed or Save
   // without data. On desktop they can also be saved as file references that
   // reload from disk on reopen, so the prompt offers Embed or Save file
-  // references. Returns the layers override to serialize, an empty result to use
-  // the live layers as-is, or "cancel" to abort the save.
+  // references. The Mac App Store build is the exception: its sandbox drops
+  // access to user-selected files once the process exits, so references cannot
+  // reload and Embed is the only durable mode (see the guard below). Returns
+  // the layers override to serialize, an empty result to use the live layers
+  // as-is, or "cancel" to abort the save.
   const resolveLayersForSave = async (): Promise<{ layers?: GeoLibreLayer[] } | "cancel"> => {
     const state = useAppStore.getState();
     const embeddable = await materializeEmbeddableVectorLayers(state.layers);
     if (useAppStore.getState().projectGeneration !== state.projectGeneration) return "cancel";
-    const localFileLayers = isTauri() ? state.layers.filter(isReloadableLocalFileLayer) : [];
+    const editedLayers = state.layers.filter(hasEditedGeometry);
+    for (const layer of editedLayers) embeddable.set(layer.id, layer.geojson!);
+    const localFileLayers = isTauri()
+      ? state.layers.filter(
+          (layer) => isReloadableLocalFileLayer(layer) && !embeddable.has(layer.id),
+        )
+      : [];
     if (embeddable.size === 0 && localFileLayers.length === 0) return {};
 
     const count = embeddable.size + localFileLayers.length;
@@ -973,17 +1148,41 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     // size that was acknowledged. A remembered Save without data stays silent
     // only for the layers whose data the user accepted losing. Both are
     // material risks that deserve a fresh confirmation even though the ordinary
-    // per-project choice is remembered. On desktop that second case cannot
-    // arise: "without data" writes file references, so nothing is discarded.
-    const discardedLayerIds = isTauri() ? [] : [...embeddable.keys()];
-    const rememberedVectorChoice = reusableVectorDataChoice(remembered, {
+    // per-project choice is remembered. Geometry edits also need embedding on
+    // desktop: file references would reload the original geometries.
+    const discardedLayerIds = isTauri()
+      ? editedLayers.map((layer) => layer.id)
+      : [...embeddable.keys()];
+    const reusableChoice = reusableVectorDataChoice(remembered, {
       embedBytes: bytes,
       warningBytes: LARGE_EMBED_WARNING_BYTES,
       discardedLayerIds,
+      editedLayerIds: editedLayers.map((layer) => layer.id),
     });
-    const choice =
+    // A remembered choice the durability guard below would have to override is
+    // not reusable: silently upgrading it to Embed would skip the prompt, and
+    // with it both the large-data warning and the acknowledged-size bookkeeping
+    // that a silent reuse deliberately leaves alone.
+    const rememberedVectorChoice =
+      reusableChoice !== undefined &&
+      durableVectorDataChoice(reusableChoice, IS_MAS_BUILD) !== reusableChoice
+        ? undefined
+        : reusableChoice;
+    const requestedChoice =
       rememberedVectorChoice ??
-      (await askEmbedVectorData(count, bytes, isTauri(), state.projectGeneration));
+      (await askEmbedVectorData(
+        count,
+        bytes,
+        isTauri(),
+        state.projectGeneration,
+        editedLayers.length > 0,
+      ));
+    // A Mac App Store app receives temporary access to user-selected files.
+    // That access expires when the sandboxed process exits, so a path-only
+    // project cannot restore its local vectors after the next launch. Embed is
+    // the only durable save mode there. Keep this guard behind the dialog as
+    // well, so an old remembered "reference" choice cannot bypass it.
+    const choice = durableVectorDataChoice(requestedChoice, IS_MAS_BUILD);
     if (choice === "cancel") return "cancel";
     // A project can be opened while a prompt is visible. Do not apply that
     // prompt's answer to the replacement project or continue saving stale data.
@@ -1025,6 +1224,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     if (!isTauri()) return {};
     let changed = false;
     const layers = useAppStore.getState().layers.map((layer) => {
+      if (hasEditedGeometry(layer) && !isReloadableLocalFileLayer(layer)) return layer;
       // Plain GeoJSON with an absolute path → reference (drop the embedded copy).
       if (isReloadableLocalFileLayer(layer)) {
         changed = true;
@@ -1141,8 +1341,11 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       remoteProject.projectGeneration === saveProjectGeneration
     ) {
       try {
+        // Re-resolved per save: an OAuth access token captured at open time
+        // may have expired; `remoteProject.token` is the personal-token fallback.
+        const token = await resolveShareRequestToken(remoteProject.token, remoteProject.baseUrl);
         const updated = await updateSharedProjectContent({
-          token: remoteProject.token,
+          token,
           projectId: remoteProject.id,
           content: contentToSave,
           expectedVersion: remoteProject.versionCount,
@@ -1166,7 +1369,18 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       } catch (error) {
         console.error("Failed to update shared project", error);
         setActionError(
-          error instanceof Error ? error.message : t("toolbar.error.couldNotSaveProject"),
+          error instanceof ShareOAuthError
+            ? t(shareOAuthErrorKey(error.code))
+            : error instanceof ShareUploadError && error.code === "unauthorized"
+              ? t(
+                  supportsShareOAuth()
+                    ? "gallery.errorUnauthorizedOAuth"
+                    : "gallery.errorUnauthorized",
+                  { shareHost: shareHostLabel() },
+                )
+              : error instanceof Error
+                ? error.message
+                : t("toolbar.error.couldNotSaveProject"),
         );
         return false;
       }
@@ -1178,7 +1392,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     // download under a fixed name, so Save As (and a first Save) would otherwise
     // reuse a default name — exactly the bug users hit. Prompt for the name so
     // they can choose it; later in-place Saves reuse the chosen name silently.
-    let saveName = `${defaultProjectName}.geolibre.json`;
+    let saveName = `${defaultProjectName}.geolibre`;
     const promptForName =
       browserSaveFallsBackToDownload() && (options?.saveAs === true || !existingLocalPath);
     if (promptForName) {
@@ -1358,6 +1572,9 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
   return {
     actionError,
     setActionError,
+    droppedProjectPrompt,
+    droppedProjectSaving,
+    resolveDroppedProjectPrompt,
     qgisImportWarnings,
     setQgisImportWarnings,
     arcgisImportWarnings,
@@ -1386,6 +1603,8 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     submitSaveNamePrompt,
     cancelSaveNamePrompt,
     handleOpenFromFile,
+    handleDroppedProject,
+    handleNativeProjectOpen,
     handleImportQgisProject,
     handleImportArcgisProject,
     handleOpenFromUrl,

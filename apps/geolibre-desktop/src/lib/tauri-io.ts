@@ -1,4 +1,6 @@
 import {
+  localFileName,
+  batchDecodePolylines,
   hasPathTraversal,
   isAbsoluteFilesystemPath,
   parseProject,
@@ -19,7 +21,7 @@ import {
 } from "@tauri-apps/plugin-fs";
 import type { StartupSettings } from "../hooks/useDesktopSettings";
 import { unzip } from "fflate";
-import type { FeatureCollection } from "geojson";
+import type { Feature, FeatureCollection } from "geojson";
 import i18next from "i18next";
 import { combine, parseDbf, parseShp } from "shpjs";
 import {
@@ -55,14 +57,18 @@ import { PHOTO_IMAGE_EXTENSIONS, isPhotoDropFileName, isPhotoFileName } from "./
 import { projectedGeoJsonCrs } from "./crs-utils";
 import { nativeFileDialogFilters, type FileDialogFilter } from "./file-dialog-filters";
 import { parseGpxLayer } from "./gpx";
+import { isDesktopRuntime } from "./is-mobile";
 import { isTauri } from "./is-tauri";
 import { SHAPEFILE_COMPANION_EXTENSIONS, shapefileCompanionPathsFromSelection } from "./mas-build";
 import {
+  KML_FOLDER_PATH_PROPERTY,
+  KML_TIME_PROPERTY,
   parseKmlGroundOverlays,
   parseKmlModels,
   parseKmlText,
   type KmlGroundOverlay,
   type KmlModel,
+  type KmlTimeBounds,
 } from "./kml";
 import {
   registerKmlSuperOverlay,
@@ -84,7 +90,7 @@ import { tiffBytesToPngBytes } from "./tiff-image";
 export { isTauri };
 
 function browserSafeFileName(path: string): string {
-  return path.split(/[/\\]/).pop() || "project.geolibre.json";
+  return localFileName(path) || "project.geolibre";
 }
 
 export type { FileDialogFilter } from "./file-dialog-filters";
@@ -152,6 +158,12 @@ const GEOLIBRE_PROJECT_FILE_TYPES: BrowserFilePickerType[] = [
     },
   },
 ];
+
+/** Project extension handled as a workspace switch by drag-and-drop. */
+export function isGeoLibreProjectFileName(path: string): boolean {
+  const name = browserSafeFileName(path).toLowerCase();
+  return name.endsWith(".geolibre") || name.endsWith(".geolibre.json");
+}
 
 interface SaveTextFileOptions {
   defaultName: string;
@@ -272,6 +284,18 @@ export interface LoadedVectorLayer {
   data: FeatureCollection;
   name?: string;
   path: string;
+  /** Enclosing KML Folder names, reconstructed as nested layer groups. */
+  groupPath?: string[];
+  /**
+   * Epoch-ms time bounds when the layer is a frame of time-tagged KML
+   * placemarks. Set (with `groupId`/`visible`) by {@link sequenceTimeFrames};
+   * the Time Slider animates these frames.
+   */
+  timeSpan?: { begin: number | null; end: number | null };
+  /** Shared group id linking the frames of one animation. */
+  groupId?: string;
+  /** Initial visibility: only the first time step of a sequence starts visible. */
+  visible?: boolean;
 }
 
 /**
@@ -295,7 +319,7 @@ export interface LoadedImageOverlay {
   /**
    * Epoch-ms time bounds when the overlay is a `<TimeSpan>`/`<TimeStamp>` frame
    * in a time-animated sequence. Set (with `groupId`/`visible`) by
-   * {@link sequenceTimeOverlays}; the Time Slider animates these frames.
+   * {@link sequenceTimeFrames}; the Time Slider animates these frames.
    */
   timeSpan?: { begin: number | null; end: number | null };
   /** Shared group id linking the frames of one animation. */
@@ -434,13 +458,8 @@ function pathWithoutExtension(path: string): string {
   return path.replace(/\.[^.\\/]+$/, "");
 }
 
-function isGeoLibreProjectFile(path: string): boolean {
-  const name = browserSafeFileName(path).toLowerCase();
-  return name.endsWith(".geolibre") || name.endsWith(".geolibre.json");
-}
-
 function isVectorFileName(path: string): boolean {
-  if (isGeoLibreProjectFile(path)) return false;
+  if (isGeoLibreProjectFileName(path)) return false;
   if (browserSafeFileName(path).toLowerCase().endsWith(".shp.xml")) return false;
   // Rasters are handled by the raster drop path, not the DuckDB vector loader.
   if (isRasterFileName(path)) return false;
@@ -473,6 +492,192 @@ function mergeFeatureCollections(collections: FeatureCollection[]): FeatureColle
     type: "FeatureCollection",
     features: collections.flatMap((collection) => collection.features),
   };
+}
+
+/**
+ * Above this many foldered placemarks, a KML import stops giving each placemark
+ * its own layer and merges them into one layer per `<Folder>` instead. Every
+ * layer is a store mutation, a MapLibre source, and a Layers panel row, and the
+ * cost grows faster than the count: an isosurface export of a few hundred
+ * triangle placemarks froze the page for most of a minute (#2411).
+ */
+export const KML_PLACEMARK_LAYER_LIMIT = 50;
+
+/**
+ * The most layers a time-animated KML import may split into. Every time window
+ * becomes at least one layer, so a file with more distinct times than this
+ * loads as static layers rather than freezing the page the same way one layer
+ * per placemark did (#2411).
+ */
+export const KML_TIME_FRAME_LAYER_LIMIT = 100;
+
+/** A placemark with its internal KML import metadata read off and stripped. */
+interface KmlPlacemarkEntry {
+  feature: Feature;
+  groupPath: string[];
+  time: KmlTimeBounds | null;
+  index: number;
+}
+
+/** Placemarks that end up in one layer. */
+interface KmlPlacemarkBucket {
+  entries: KmlPlacemarkEntry[];
+  groupPath: string[];
+  time: KmlTimeBounds | null;
+}
+
+function kmlTimeFromProperty(value: unknown): KmlTimeBounds | null {
+  if (!value || typeof value !== "object") return null;
+  const { begin, end } = value as { begin?: unknown; end?: unknown };
+  return {
+    begin: typeof begin === "number" && Number.isFinite(begin) ? begin : null,
+    end: typeof end === "number" && Number.isFinite(end) ? end : null,
+  };
+}
+
+/** A short UTC label for a frame start, e.g. "2024-01-01" or "2024-01-01 06:00". */
+function kmlTimeLabel(begin: number): string {
+  const iso = new Date(begin).toISOString();
+  const [date, clock] = [iso.slice(0, 10), iso.slice(11, 19)];
+  if (clock === "00:00:00") return date;
+  return `${date} ${clock.endsWith(":00") ? clock.slice(0, 5) : clock}`;
+}
+
+/**
+ * Split folder-aware KML placemarks into layers that can occupy distinct groups.
+ *
+ * Only placemarks that actually sit inside a `<Folder>` are split out;
+ * everything else stays merged into a single layer, as it was before folder
+ * support. A real-world export is often a handful of foldered placemarks among
+ * hundreds of flat ones, and splitting those too would turn one cheap layer add
+ * into hundreds of store mutations and layer-panel rows. For the same reason a
+ * file with more than {@link KML_PLACEMARK_LAYER_LIMIT} foldered placemarks gets
+ * one layer per Folder rather than one per placemark.
+ *
+ * Placemarks carrying a `<TimeSpan>`/`<TimeStamp>` (their own or inherited from
+ * a Folder) with at least two distinct start times become Time Slider frames:
+ * placemarks sharing a folder and a time window share a layer, and the layers
+ * are sequenced like ground-overlay frames so only the first time step starts
+ * visible.
+ *
+ * @param collection - Placemarks parsed by `parseKmlText`, still carrying the
+ *   internal folder/time properties.
+ * @param path - The source file path.
+ * @returns The layers to add, in store insertion order.
+ */
+export function splitKmlFolderLayers(
+  collection: FeatureCollection,
+  path: string,
+): LoadedVectorLayer[] {
+  const hasImportMetadata = collection.features.some(
+    (feature) =>
+      Array.isArray(feature.properties?.[KML_FOLDER_PATH_PROPERTY]) ||
+      feature.properties?.[KML_TIME_PROPERTY] != null,
+  );
+  if (!hasImportMetadata) return [{ data: collection, path }];
+
+  const entries: KmlPlacemarkEntry[] = collection.features.map((feature, index) => {
+    const properties = { ...(feature.properties ?? {}) };
+    const rawPath = properties[KML_FOLDER_PATH_PROPERTY];
+    const time = kmlTimeFromProperty(properties[KML_TIME_PROPERTY]);
+    delete properties[KML_FOLDER_PATH_PROPERTY];
+    delete properties[KML_TIME_PROPERTY];
+    const groupPath = Array.isArray(rawPath)
+      ? rawPath.filter((part): part is string => typeof part === "string" && part.trim() !== "")
+      : [];
+    return { feature: { ...feature, properties }, groupPath, time, index };
+  });
+
+  // Time only splits layers when the placemarks form an animation. A lone
+  // time-tagged placemark, or a whole file under one inherited `<TimeSpan>`, is
+  // not a sequence and stays an ordinary static layer.
+  const begins = new Set(
+    entries.flatMap((entry) => (typeof entry.time?.begin === "number" ? [entry.time.begin] : [])),
+  );
+  const perPlacemark =
+    entries.filter((entry) => entry.groupPath.length > 0).length <= KML_PLACEMARK_LAYER_LIMIT;
+
+  const planBuckets = (animated: boolean): Map<string, KmlPlacemarkBucket> => {
+    // Map iteration keeps first-seen document order.
+    const planned = new Map<string, KmlPlacemarkBucket>();
+    for (const entry of entries) {
+      const time = animated && typeof entry.time?.begin === "number" ? entry.time : null;
+      const key =
+        perPlacemark && entry.groupPath.length > 0
+          ? `placemark:${entry.index}`
+          : `${JSON.stringify(entry.groupPath)}|${time ? `${time.begin}|${time.end}` : ""}`;
+      const bucket = planned.get(key);
+      if (bucket) bucket.entries.push(entry);
+      else planned.set(key, { entries: [entry], groupPath: entry.groupPath, time });
+    }
+    return planned;
+  };
+
+  let buckets = planBuckets(begins.size >= 2);
+  if (begins.size >= 2 && buckets.size > KML_TIME_FRAME_LAYER_LIMIT) {
+    // One layer per time window would bring back the per-layer freeze (e.g. a
+    // GPS track with a `<TimeStamp>` on every point), so load the placemarks
+    // as static layers instead.
+    console.warn(
+      `[GeoLibre] "${path}" has ${begins.size} distinct KML times, which would need ${buckets.size} layers; loading it without Time Slider animation (limit ${KML_TIME_FRAME_LAYER_LIMIT}).`,
+    );
+    buckets = planBuckets(false);
+  }
+
+  // A merged Folder layer stands in for the Folder itself (so it is not nested
+  // in a group of the same name) unless the Folder also needs to be a group:
+  // it has sub-folders of its own, or splits into several time frames.
+  const folderKey = (groupPath: string[]) => JSON.stringify(groupPath);
+  const bucketsPerFolder = new Map<string, number>();
+  const ancestorFolders = new Set<string>();
+  for (const { groupPath } of buckets.values()) {
+    const key = folderKey(groupPath);
+    bucketsPerFolder.set(key, (bucketsPerFolder.get(key) ?? 0) + 1);
+    for (let depth = 1; depth < groupPath.length; depth += 1) {
+      ancestorFolders.add(folderKey(groupPath.slice(0, depth)));
+    }
+  }
+
+  const ungroupedLayers: LoadedVectorLayer[] = [];
+  const folderLayers: LoadedVectorLayer[] = [];
+  for (const bucket of buckets.values()) {
+    const data: FeatureCollection = {
+      type: "FeatureCollection",
+      features: bucket.entries.map((entry) => entry.feature),
+    };
+    const timeSpan = bucket.time ? { timeSpan: { ...bucket.time } } : {};
+    const timeLabel = typeof bucket.time?.begin === "number" ? kmlTimeLabel(bucket.time.begin) : "";
+    if (bucket.groupPath.length === 0) {
+      // The untimed merged layer carries no name so the import falls back to
+      // the file name; a time frame is named by its start.
+      ungroupedLayers.push({ data, path, ...(timeLabel ? { name: timeLabel } : {}), ...timeSpan });
+      continue;
+    }
+    if (perPlacemark) {
+      const [{ feature, index }] = bucket.entries;
+      const name =
+        typeof feature.properties?.name === "string" && feature.properties.name.trim() !== ""
+          ? feature.properties.name
+          : `Placemark ${index + 1}`;
+      folderLayers.push({ data, name, path, groupPath: bucket.groupPath, ...timeSpan });
+      continue;
+    }
+    const key = folderKey(bucket.groupPath);
+    const folderName = bucket.groupPath[bucket.groupPath.length - 1];
+    const standsInForFolder = bucketsPerFolder.get(key) === 1 && !ancestorFolders.has(key);
+    folderLayers.push({
+      data,
+      name: timeLabel && !standsInForFolder ? `${folderName} ${timeLabel}` : folderName,
+      path,
+      groupPath: standsInForFolder ? bucket.groupPath.slice(0, -1) : bucket.groupPath,
+      ...timeSpan,
+    });
+  }
+
+  // Store insertion is top-first, so feed layers in reverse document order to
+  // keep their visible layer/group order aligned with Google Earth. The
+  // ungrouped placemarks are added first so they settle below the folders.
+  return sequenceTimeFrames([...ungroupedLayers.reverse(), ...folderLayers.reverse()]);
 }
 
 function normalizeShapefileResult(value: unknown): FeatureCollection {
@@ -549,7 +754,7 @@ export async function readLocalFileBytes(path: string): Promise<Uint8Array<Array
  * @param path - Absolute local path to read.
  * @returns The file's decoded UTF-8 text.
  */
-async function readLocalFileText(path: string): Promise<string> {
+export async function readLocalFileText(path: string): Promise<string> {
   try {
     return await readTextFile(path);
   } catch (error) {
@@ -639,6 +844,91 @@ function parseGpxTextLayers(text: string, path: string): LoadedVectorLayer[] {
       name: `${baseName} ${layer.label}`,
       path,
     }));
+}
+
+/**
+ * Checks whether a decoded polyline FeatureCollection contains valid, non-empty WGS84 coordinates.
+ *
+ * Rejects collections with no features or 0 total coordinates, non-finite values,
+ * or coordinate values falling outside the valid WGS84 domain ([-180, 180] lon, [-90, 90] lat).
+ */
+function hasValidPolylineCoordinates(fc: FeatureCollection): boolean {
+  if (!fc.features || fc.features.length === 0) return false;
+  let totalPoints = 0;
+  for (const feature of fc.features) {
+    const geometry = feature.geometry;
+    if (!geometry) continue;
+    if (geometry.type === "LineString") {
+      for (const coord of geometry.coordinates) {
+        const [lon, lat] = coord;
+        if (
+          !Number.isFinite(lon) ||
+          !Number.isFinite(lat) ||
+          lon < -180 ||
+          lon > 180 ||
+          lat < -90 ||
+          lat > 90
+        ) {
+          return false;
+        }
+        totalPoints++;
+      }
+    } else if (geometry.type === "MultiLineString") {
+      for (const line of geometry.coordinates) {
+        for (const coord of line) {
+          const [lon, lat] = coord;
+          if (
+            !Number.isFinite(lon) ||
+            !Number.isFinite(lat) ||
+            lon < -180 ||
+            lon > 180 ||
+            lat < -90 ||
+            lat > 90
+          ) {
+            return false;
+          }
+          totalPoints++;
+        }
+      }
+    }
+  }
+  return totalPoints > 0;
+}
+
+/**
+ * Parses raw polyline text from a dropped/opened file into a vector layer.
+ *
+ * Encoded polyline format does not self-describe its precision factor. Auto-detection
+ * first attempts standard precision 5 (Google Maps / OSRM standard, factor 1e5).
+ * If precision 5 yields coordinates outside valid WGS84 bounds (which occurs when
+ * precision 6 data with latitude > 9° or longitude > 18° is scaled up by 10x),
+ * it falls back to precision 6 (Valhalla / Mapbox standard, factor 1e6).
+ *
+ * That bounds check only settles the cases it can: the two decodes of the same
+ * bytes differ by exactly a factor of 10, so whenever precision 5 lands in
+ * bounds precision 6 necessarily does too, and nothing in the data says which
+ * one the author meant. Precision-6 data close to the prime meridian and the
+ * equator (|lon| <= 18°, |lat| <= 9°) therefore imports at precision 5, ten
+ * times too large, with no error. Drag-and-drop has nowhere to ask, so it takes
+ * the more common of the two; Add Data → Encoded Polyline is the path with an
+ * explicit precision picker and a preview to check the result against.
+ */
+function parsePolylineFileLayers(text: string, path: string): LoadedVectorLayer[] {
+  let fc = batchDecodePolylines(text, { precision: 5, unescape: true });
+  if (!hasValidPolylineCoordinates(fc)) {
+    fc = batchDecodePolylines(text, { precision: 6, unescape: true });
+  }
+  if (!hasValidPolylineCoordinates(fc)) {
+    throw new Error("No valid polyline coordinates could be decoded from this file.");
+  }
+  const baseName = pathWithoutExtension(browserSafeFileName(path)) || "Polyline";
+  return [
+    {
+      data: fc,
+      name: baseName,
+      path,
+    },
+  ];
 }
 
 /** Delimited text formats the drag-and-drop / open path loads as points. */
@@ -887,7 +1177,9 @@ async function loadShapefileZip(
   }
   if (shouldRouteToDuckDb(unzipped.file.data.byteLength)) {
     console.info(
-      `[GeoLibre] "${unzipped.file.name}" is ${Math.round(unzipped.file.data.byteLength / (1024 * 1024))} MB uncompressed; reading it with DuckDB instead of shpjs to keep the parse off the main thread.`,
+      `[GeoLibre] "${unzipped.file.name}" is ${Math.round(
+        unzipped.file.data.byteLength / (1024 * 1024),
+      )} MB uncompressed; reading it with DuckDB instead of shpjs to keep the parse off the main thread.`,
     );
     return loadDuckDbVector(unzipped.file, options);
   }
@@ -977,61 +1269,67 @@ function imageOverlayLayer(
   };
 }
 
+/** A layer record that can be a frame of a time-animated KML sequence. */
+interface TimeFrameCandidate {
+  timeSpan?: { begin: number | null; end: number | null };
+  groupId?: string;
+  visible?: boolean;
+}
+
 /**
- * Turn the time-tagged overlays in a set into an animation: sort them by start
- * time, fill an open `<TimeStamp>`/`<TimeSpan>` end with the next frame's start
- * (a step function), give them a shared group id, and leave only the first
- * frame visible so the others do not all stack at once before the Time Slider
- * is opened.
+ * Turn the time-tagged layers in a set into an animation: sort them by start
+ * time, fill an open `<TimeStamp>`/`<TimeSpan>` end with the next later frame's
+ * start (a step function), give them a shared group id, and leave only the
+ * first time step visible so the others do not all stack at once before the
+ * Time Slider is opened. Frames sharing a start time (e.g. two folders tagged
+ * with the same `<TimeSpan>`) step together.
  *
- * Only overlays with a numeric start (`timeSpan.begin`) are treated as frames,
- * matching what the Time Slider can animate; an overlay with an open-start span
- * (or a lone time-tagged overlay that is not part of a sequence) has its
- * transient `timeSpan` dropped so it stays a normal static overlay the slider
+ * Only layers with a numeric start (`timeSpan.begin`) are treated as frames,
+ * matching what the Time Slider can animate; a layer with an open-start span
+ * (or a lone time-tagged layer that is not part of a sequence) has its
+ * transient `timeSpan` dropped so it stays a normal static layer the slider
  * never hides.
  *
- * @param overlays - The resolved overlays for one file, mutated in place.
+ * @param layers - The resolved ground overlays or placemark layers for one
+ *   file, mutated in place.
  * @returns The same array, for chaining.
  */
-function sequenceTimeOverlays(overlays: LoadedImageOverlay[]): LoadedImageOverlay[] {
-  const frames = overlays
+export function sequenceTimeFrames<T extends TimeFrameCandidate>(layers: T[]): T[] {
+  const frames = layers
     .filter(
-      (
-        overlay,
-      ): overlay is LoadedImageOverlay & {
-        timeSpan: { begin: number; end: number | null };
-      } => typeof overlay.timeSpan?.begin === "number",
+      (layer): layer is T & { timeSpan: { begin: number; end: number | null } } =>
+        typeof layer.timeSpan?.begin === "number",
     )
     .sort((a, b) => a.timeSpan.begin - b.timeSpan.begin);
 
   // An animation needs at least two frames with distinct start times. A lone
-  // time-tagged overlay, or several sharing one time (e.g. a single inherited
+  // time-tagged layer, or several sharing one time (e.g. a single inherited
   // Folder `<TimeSpan>`), is not a sequence; strip every transient timeSpan so
-  // the Time Slider treats these overlays as ordinary static layers.
-  const distinctBegins = new Set(frames.map((frame) => frame.timeSpan.begin));
-  if (distinctBegins.size < 2) {
-    for (const overlay of overlays) delete overlay.timeSpan;
-    return overlays;
+  // the Time Slider treats these layers as ordinary static layers.
+  const begins = [...new Set(frames.map((frame) => frame.timeSpan.begin))];
+  if (begins.length < 2) {
+    for (const layer of layers) delete layer.timeSpan;
+    return layers;
   }
 
-  const inSequence = new Set<LoadedImageOverlay>(frames);
+  const inSequence = new Set<T>(frames);
   const groupId = crypto.randomUUID();
-  frames.forEach((frame, index) => {
+  for (const frame of frames) {
     frame.groupId = groupId;
-    frame.visible = index === 0;
-    // A frame with an open end runs until the next frame begins (or stays open
-    // for the last frame), so an instant-tagged sequence steps cleanly.
+    frame.visible = frame.timeSpan.begin === begins[0];
+    // A frame with an open end runs until the next time step begins (or stays
+    // open for the last step), so an instant-tagged sequence steps cleanly.
     if (frame.timeSpan.end === null) {
-      const next = frames[index + 1]?.timeSpan.begin;
+      const next = begins.find((begin) => begin > frame.timeSpan.begin);
       if (typeof next === "number") frame.timeSpan.end = next;
     }
-  });
-  // Any time-tagged overlay left out of the sequence (e.g. an open-start span)
-  // should not be animated, so drop its timeSpan too.
-  for (const overlay of overlays) {
-    if (!inSequence.has(overlay)) delete overlay.timeSpan;
   }
-  return overlays;
+  // Any time-tagged layer left out of the sequence (e.g. an open-start span)
+  // should not be animated, so drop its timeSpan too.
+  for (const layer of layers) {
+    if (!inSequence.has(layer)) delete layer.timeSpan;
+  }
+  return layers;
 }
 
 // A ground-overlay image is inlined as a base64 `data:` URL on the layer and
@@ -1117,7 +1415,7 @@ async function groundOverlaysFromKmz(
     }
     overlays.push(imageOverlayLayer(overlay, await bytesToDataUrl(image, mime), path));
   }
-  return sequenceTimeOverlays(overlays);
+  return sequenceTimeFrames(overlays);
 }
 
 // Whether an overlay's image is a TIFF that lives at an absolute URL. Unlike an
@@ -1170,7 +1468,7 @@ function groundOverlaysFromKml(text: string, path: string): LoadedImageOverlay[]
     if (isRemoteTiffOverlay(overlay.href)) continue;
     overlays.push(imageOverlayLayer(overlay, overlay.href.trim(), path));
   }
-  return sequenceTimeOverlays(overlays);
+  return sequenceTimeFrames(overlays);
 }
 
 // A KML `<Model>` GLB is inlined as a base64 `data:` URL on the layer (textures
@@ -1390,9 +1688,9 @@ async function fetchDaeAsGlbDataUrl(href: string): Promise<{
     const daeBytes = new Blob([daeText]).size;
     if (daeBytes > MAX_DAE_SOURCE_BYTES) {
       console.warn(
-        `Skipping a KML model: "${href}" is ${Math.round(daeBytes / (1024 * 1024))} MB, over the ${Math.round(
-          MAX_DAE_SOURCE_BYTES / (1024 * 1024),
-        )} MB limit.`,
+        `Skipping a KML model: "${href}" is ${Math.round(
+          daeBytes / (1024 * 1024),
+        )} MB, over the ${Math.round(MAX_DAE_SOURCE_BYTES / (1024 * 1024))} MB limit.`,
       );
       return null;
     }
@@ -1591,7 +1889,9 @@ async function loadKmzLayers(
             entries,
             options,
           );
-          if (features.features.length > 0) layers.push({ data: features, path });
+          if (features.features.length > 0) {
+            layers.push(...splitKmlFolderLayers(features, path));
+          }
         } catch (error) {
           // Declining the oversized-vector prompt must not throw away the
           // pyramid, which is already registered and loads on its own.
@@ -1627,7 +1927,7 @@ async function loadKmzLayers(
   let cancellation: unknown;
   try {
     const features = await kmzVectorFeatures(kmlFiles, entries, options);
-    if (features.features.length > 0) layers.push({ data: features, path });
+    if (features.features.length > 0) layers.push(...splitKmlFolderLayers(features, path));
   } catch (error) {
     if (!isVectorLoadCancelled(error)) throw error;
     cancellation = error;
@@ -1941,7 +2241,9 @@ async function loadBrowserVectorFile(
   // route here would be misleading for a container near the threshold.
   if (streamViaDuckDb && ROUTABLE_TEXT_EXTENSIONS.has(extension)) {
     console.info(
-      `[GeoLibre] "${file.name}" is ${Math.round(file.size / (1024 * 1024))} MB; streaming it through DuckDB instead of the in-memory reader.`,
+      `[GeoLibre] "${file.name}" is ${Math.round(
+        file.size / (1024 * 1024),
+      )} MB; streaming it through DuckDB instead of the in-memory reader.`,
     );
   }
 
@@ -1987,6 +2289,15 @@ async function loadBrowserVectorFile(
   if (extension === "gpx") {
     return {
       data: parseGpxText(await file.text()),
+      path: file.name,
+    };
+  }
+
+  if (extension === "polyline") {
+    const text = await file.text();
+    const [layer] = parsePolylineFileLayers(text, file.name);
+    return {
+      data: layer.data,
       path: file.name,
     };
   }
@@ -2191,6 +2502,7 @@ async function tryLoadPickedNativeVectorPath(
     extension === "kml" ||
     extension === "kmz" ||
     extension === "gpx" ||
+    extension === "polyline" ||
     extension === "zip"
   ) {
     return undefined;
@@ -2226,7 +2538,9 @@ async function loadTauriVectorFile(
   // See `loadBrowserVectorFile`: containers decide their own routing later.
   if (streamViaDuckDb && ROUTABLE_TEXT_EXTENSIONS.has(extension)) {
     console.info(
-      `[GeoLibre] "${browserSafeFileName(path)}" is ${Math.round((sizeBytes ?? 0) / (1024 * 1024))} MB; streaming it through DuckDB instead of the in-memory reader.`,
+      `[GeoLibre] "${browserSafeFileName(path)}" is ${Math.round(
+        (sizeBytes ?? 0) / (1024 * 1024),
+      )} MB; streaming it through DuckDB instead of the in-memory reader.`,
     );
   }
 
@@ -2283,6 +2597,20 @@ async function loadTauriVectorFile(
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown error";
       throw new Error(`Could not read this GPX file. ${detail}`);
+    }
+  }
+
+  if (extension === "polyline") {
+    try {
+      const text = await readLocalFileText(path);
+      const [layer] = parsePolylineFileLayers(text, path);
+      return {
+        data: layer.data,
+        path,
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      throw new Error(`Could not read this Polyline file. ${detail}`);
     }
   }
 
@@ -2447,7 +2775,7 @@ async function saveProjectFileBrowser(
   content: string,
   defaultName?: string,
 ): Promise<string | null> {
-  const fileName = browserSafeFileName(defaultName ?? "project.geolibre.json");
+  const fileName = browserSafeFileName(defaultName ?? "project.geolibre");
   const pickerWindow = window as BrowserFilePickerWindow;
 
   if (pickerWindow.showSaveFilePicker) {
@@ -2612,6 +2940,49 @@ export async function openLocalDataFileWithFallback(options: LocalDataFileOption
   });
 }
 
+/** Open a multi-file picker and read every selected file as bytes. */
+export async function openLocalDataFilesWithFallback(
+  options: LocalDataFileOptions,
+): Promise<Array<{ data: ArrayBuffer; path: string }>> {
+  if (isTauri()) {
+    const selected = await open({
+      multiple: true,
+      filters: nativeFileDialogFilters(options.filters, options.androidFilters),
+    });
+    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    return Promise.all(
+      paths.map(async (path) => ({
+        data: toArrayBuffer(await readFile(path)),
+        path,
+      })),
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.accept = options.accept;
+    input.onchange = async () => {
+      try {
+        const files = Array.from(input.files ?? []);
+        resolve(
+          await Promise.all(
+            files.map(async (file) => ({
+              data: await file.arrayBuffer(),
+              path: file.name,
+            })),
+          ),
+        );
+      } catch (error) {
+        reject(error);
+      }
+    };
+    input.addEventListener("cancel", () => resolve([]));
+    input.click();
+  });
+}
+
 export async function pickLocalPathWithFallback(
   options: PickLocalPathOptions = {},
 ): Promise<string | null> {
@@ -2628,6 +2999,19 @@ export async function pickLocalPathWithFallback(
   // require a real path. Return null so callers surface the desktop-only
   // message rather than passing a non-resolvable bare file name.
   return null;
+}
+
+/** Pick several native filesystem paths (desktop only). */
+export async function pickLocalPathsWithFallback(
+  options: PickLocalPathOptions = {},
+): Promise<string[]> {
+  if (!isTauri()) return [];
+  const selected = await open({
+    directory: options.directory ?? false,
+    filters: options.filters,
+    multiple: true,
+  });
+  return Array.isArray(selected) ? selected : selected ? [selected] : [];
 }
 
 /**
@@ -2771,13 +3155,18 @@ export class RecentProjectGoneError extends Error {
  */
 const startupSnapshotIo: StartupSnapshotIo = {
   write: async (file, content) => {
-    await mkdir(STARTUP_SNAPSHOT_DIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+    await mkdir(STARTUP_SNAPSHOT_DIR, {
+      baseDir: BaseDirectory.AppLocalData,
+      recursive: true,
+    });
     await writeTextFile(`${STARTUP_SNAPSHOT_DIR}/${file}`, content, {
       baseDir: BaseDirectory.AppLocalData,
     });
   },
   read: (file) =>
-    readTextFile(`${STARTUP_SNAPSHOT_DIR}/${file}`, { baseDir: BaseDirectory.AppLocalData }),
+    readTextFile(`${STARTUP_SNAPSHOT_DIR}/${file}`, {
+      baseDir: BaseDirectory.AppLocalData,
+    }),
 };
 
 /**
@@ -2954,7 +3343,7 @@ export async function saveProjectFile(
 
   const path = await save({
     filters: [{ name: "GeoLibre Project", extensions: ["geolibre", "json"] }],
-    defaultPath: defaultName ?? "project.geolibre.json",
+    defaultPath: defaultName ?? "project.geolibre",
   });
   if (!path) return null;
   await writeTextFile(path, content);
@@ -3109,6 +3498,11 @@ export async function loadDroppedVectorFiles(
         continue;
       }
 
+      if (extension === "polyline") {
+        layers.push(...parsePolylineFileLayers(await file.text(), file.name));
+        continue;
+      }
+
       if (extension === "kmz") {
         try {
           layers.push(...(await loadKmzLayers(await file.arrayBuffer(), file.name, options)));
@@ -3136,7 +3530,9 @@ export async function loadDroppedVectorFiles(
           // fallback for an overlay-only KML can return an empty collection, and
           // an empty vector layer alongside the overlay is just clutter.
           const vector = await loadBrowserVectorFile(file, [], options);
-          if (vector.data.features.length > 0) layers.push(vector);
+          if (vector.data.features.length > 0) {
+            layers.push(...splitKmlFolderLayers(vector.data, vector.path));
+          }
         } catch (error) {
           // Declining the oversized-vector prompt, or a genuine parse failure,
           // still leaves any ground overlays/models already added above (a real
@@ -3200,7 +3596,7 @@ export interface DroppedRaster {
 }
 
 function fileBaseName(path: string): string {
-  return path.split(/[\\/]/).pop() || path;
+  return localFileName(path) || path;
 }
 
 /** Collect dropped browser File objects that are rasters the map can load. */
@@ -3298,10 +3694,16 @@ export async function pickLocalRasterFiles(): Promise<{ file: File | string; pat
  */
 export async function pickImageFilesWithFallback(): Promise<File[]> {
   if (isTauri()) {
-    const selected = await open({
-      multiple: true,
-      filters: [{ name: "Images", extensions: [...PHOTO_IMAGE_EXTENSIONS] }],
-    });
+    // Desktop uses a native picker and one-shot reader, so selected photos do
+    // not enter either persisted scope. Mobile keeps the plugin picker because
+    // its selections can be content URIs.
+    const desktop = isDesktopRuntime();
+    const selected = desktop
+      ? await invoke<string[]>("pick_image_paths")
+      : await open({
+          multiple: true,
+          filters: [{ name: "Images", extensions: [...PHOTO_IMAGE_EXTENSIONS] }],
+        });
     if (!selected) return [];
     const paths = (Array.isArray(selected) ? selected : [selected]).filter(isPhotoFileName);
     const files: File[] = [];
@@ -3309,7 +3711,10 @@ export async function pickImageFilesWithFallback(): Promise<File[]> {
       // Read each pick independently so one unreadable file does not abandon the
       // rest of the selection.
       try {
-        files.push(new File([toArrayBuffer(await readFile(path))], browserSafeFileName(path)));
+        const bytes = desktop
+          ? await invoke<ArrayBuffer>("read_selected_image", { path })
+          : await readFile(path);
+        files.push(new File([bytes], browserSafeFileName(path)));
       } catch (error) {
         console.warn(`Could not read the selected image "${path}".`, error);
       }
@@ -3391,6 +3796,15 @@ export async function loadDroppedVectorPaths(
         }
         continue;
       }
+      if (extension === "polyline") {
+        try {
+          layers.push(...parsePolylineFileLayers(await readLocalFileText(path), path));
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`Could not read this Polyline file. ${detail}`);
+        }
+        continue;
+      }
       if (extension === "kmz") {
         try {
           layers.push(...(await loadKmzLayers(await readLocalFileBytes(path), path, options)));
@@ -3415,7 +3829,9 @@ export async function loadDroppedVectorPaths(
           // Only add a vector layer when it actually has features (an overlay-only
           // KML's DuckDB fallback can return an empty collection).
           const vector = await loadTauriVectorFile(path, options);
-          if (vector.data.features.length > 0) layers.push(vector);
+          if (vector.data.features.length > 0) {
+            layers.push(...splitKmlFolderLayers(vector.data, vector.path));
+          }
         } catch (error) {
           // Declining the oversized-vector prompt, or a genuine parse failure,
           // still leaves any ground overlays/models already added above (a real

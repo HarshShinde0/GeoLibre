@@ -18,7 +18,7 @@ import {
   type StoryMap,
   type StorySlideMode,
 } from "@geolibre/core";
-import type { MapController } from "@geolibre/map";
+import type { MapEngine } from "@geolibre/map";
 import {
   Button,
   ColorField,
@@ -56,11 +56,12 @@ import {
 } from "lucide-react";
 import { saveTextFileWithFallback } from "../../lib/tauri-io";
 import { promptDownloadNameIfNeeded } from "../../hooks/useFileNamePrompt";
-import { buildStoryMapHtml } from "../../lib/storymap-export";
+import { buildStoryMapHtml, storyExportCandidates } from "../../lib/storymap-export";
+import { bakeStoryMarkerImages } from "../../lib/storymap-marker-images";
 import { StoryMapHandoutDialog } from "./StoryMapHandoutDialog";
 
 interface StoryMapPanelProps {
-  mapControllerRef: RefObject<MapController | null>;
+  mapControllerRef: RefObject<MapEngine | null>;
 }
 
 function createId(): string {
@@ -360,6 +361,8 @@ export function StoryMapPanel({ mapControllerRef }: StoryMapPanelProps) {
         layers: layersForExport,
         projection,
         navToggleLabel: t("storymap.toggleNav"),
+        // Bake only the layers the export can include, not the whole project.
+        markerImages: await bakeStoryMarkerImages(storyExportCandidates(story, layersForExport)),
       });
       const slug =
         (story.title || "story-map")

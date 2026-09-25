@@ -51,6 +51,18 @@ export const PROJECT_CREDENTIAL_FIELDS = {
 export const PUBLISHABLE_PLUGIN_SETTINGS: Readonly<Record<string, readonly string[] | null>> = {
   "maplibre-gl-swipe": null,
   "maplibre-gl-components": ["legend", "colorbar"],
+  // This is the source of truth for dock-owned temporal layers. Dropping it
+  // leaves only their external-native store mirrors in a shared project; those
+  // mirrors contain a MapLibre source id, not enough information to recreate
+  // the COG/mosaic/tiles for a recipient. The retained blob is still passed
+  // through redactConfigurationValue below, including every source URL.
+  "maplibre-gl-time-slider": null,
+  // Feed toggles (one boolean per feed) plus a numeric clock speed — no URLs,
+  // no keys, nothing user-authored. Listed as a whole blob rather than by key
+  // because the feed set grows with every new feed; an enumerated list would
+  // silently start counting each new toggle as a credential, which is the bug
+  // this entry fixes. Still swept by redactConfigurationValue below.
+  "gods-eye-view": null,
 };
 
 export interface CredentialRedactionResult {
@@ -342,8 +354,24 @@ export function redactProjectCredentials(project: GeoLibreProject): CredentialRe
       }
     }
   }
+  // The Mapbox-only style is a URL like the shared basemap and can carry an
+  // access token; sweep it the same way so the save prompt counts it and a
+  // "strip" choice actually removes it.
+  const mapboxStyleUrl = project.preferences?.map?.mapboxStyleUrl;
+  const redactedMapboxStyleUrl =
+    typeof mapboxStyleUrl === "string" ? redactUrlCredentials(mapboxStyleUrl) : mapboxStyleUrl;
+  if (redactedMapboxStyleUrl !== mapboxStyleUrl) {
+    recordRedaction(accumulator, "preferences.map.mapboxStyleUrl", mapboxStyleUrl);
+  }
   const preferences = project.preferences
-    ? { ...project.preferences, environmentVariables: [], geocoding }
+    ? {
+        ...project.preferences,
+        environmentVariables: [],
+        geocoding,
+        ...(redactedMapboxStyleUrl !== mapboxStyleUrl
+          ? { map: { ...project.preferences.map, mapboxStyleUrl: redactedMapboxStyleUrl } }
+          : {}),
+      }
     : project.preferences;
   const populatedEnvironmentVariables =
     project.preferences?.environmentVariables?.filter((variable) => variable.key.trim()) ?? [];
@@ -365,41 +393,56 @@ export function redactProjectCredentials(project: GeoLibreProject): CredentialRe
     );
   }
 
-  const layers = (project.layers ?? []).map((layer, index) => ({
-    ...layer,
-    source: redactConfigurationValue(
-      layer.source,
-      `layers[${index}].source`,
-      accumulator,
-    ) as Record<string, unknown>,
-    metadata: redactConfigurationValue(
+  const layers = (project.layers ?? []).map((layer, index) => {
+    // `export: false` strips the feature data this project *carries* — the
+    // inline `geojson` and the `embeddedGeoJSON` snapshot. It deliberately
+    // leaves `source`/`connection` alone, so a layer that fetches live (WFS,
+    // ArcGIS FeatureServer, a remote GeoJSON or tile URL) still travels with a
+    // reachable URL and re-fetches the same data when the shared project is
+    // opened. Stripping those would ship a layer that cannot render at all;
+    // whether that is the right trade is tracked in the docs' caveat.
+    const isNoExport = layer.capabilities?.export === false;
+    const cleanMetadata = redactConfigurationValue(
       layer.metadata,
       `layers[${index}].metadata`,
       accumulator,
-    ) as Record<string, unknown>,
-    ...(typeof layer.sourcePath === "string"
-      ? {
-          sourcePath: redactConfigurationValue(
-            layer.sourcePath,
-            `layers[${index}].sourcePath`,
-            accumulator,
-          ) as string,
-        }
-      : {}),
-    // `connection.lastError` is free-form text taken from a caught error, and a
-    // refresh path that words it as `Failed to fetch ${url}` would carry the
-    // request's credential parameters. Sweeping it costs nothing and keeps the
-    // no-secret guarantee from depending on how an error message is phrased.
-    ...(layer.connection
-      ? {
-          connection: redactConfigurationValue(
-            layer.connection,
-            `layers[${index}].connection`,
-            accumulator,
-          ) as LayerConnection,
-        }
-      : {}),
-  }));
+    ) as Record<string, unknown>;
+    if (isNoExport && "embeddedGeoJSON" in cleanMetadata) {
+      delete cleanMetadata.embeddedGeoJSON;
+    }
+    return {
+      ...layer,
+      ...(isNoExport ? { geojson: undefined } : {}),
+      source: redactConfigurationValue(
+        layer.source,
+        `layers[${index}].source`,
+        accumulator,
+      ) as Record<string, unknown>,
+      metadata: cleanMetadata,
+      ...(typeof layer.sourcePath === "string"
+        ? {
+            sourcePath: redactConfigurationValue(
+              layer.sourcePath,
+              `layers[${index}].sourcePath`,
+              accumulator,
+            ) as string,
+          }
+        : {}),
+      // `connection.lastError` is free-form text taken from a caught error, and a
+      // refresh path that words it as `Failed to fetch ${url}` would carry the
+      // request's credential parameters. Sweeping it costs nothing and keeps the
+      // no-secret guarantee from depending on how an error message is phrased.
+      ...(layer.connection
+        ? {
+            connection: redactConfigurationValue(
+              layer.connection,
+              `layers[${index}].connection`,
+              accumulator,
+            ) as LayerConnection,
+          }
+        : {}),
+    };
+  });
 
   let plugins = project.plugins;
   if (plugins) {

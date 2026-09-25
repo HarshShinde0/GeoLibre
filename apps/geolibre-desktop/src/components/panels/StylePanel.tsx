@@ -1,6 +1,12 @@
 import {
+  BLEND_MODES,
+  DEFAULT_BLEND_MODE,
   DEFAULT_LAYER_STYLE,
+  LABEL_NUMBER_LOCALES,
+  controlRendersLayer,
+  formatLabelNumberSample,
   isInitialLayerStyle,
+  type BlendMode,
   type DiagramField,
   type GeoLibreLayer,
   type DiagramSizeMode,
@@ -20,6 +26,8 @@ import {
   type VectorStyleStop,
   collectDiagramData,
   geojsonHasZCoordinates,
+  isCzmlLayer,
+  isCesiumKmlLayer,
   isStyleLibraryTargetLayer,
   parseJsonExpression,
   pluginOwnsPaint,
@@ -50,14 +58,30 @@ import {
   countAtlasDroppedDiagrams,
   getVectorLayerPropertyValues,
 } from "@geolibre/plugins";
-import { type MapController } from "@geolibre/map";
+import {
+  arcgisVectorStyle,
+  layerBlendModesSupported,
+  mapboxUnsupportedStyleSettings,
+  arcgisRasterEffect,
+  arcgisUnsupportedStyleSettings,
+  subscribeLayerBlendModeSupport,
+  type MapEngine,
+} from "@geolibre/map";
 import type { ParseKeys, TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { AttributeFormSection } from "./AttributeFormSection";
+import { PopupSection } from "./PopupSection";
 import { EditorTrackingSection } from "./EditorTrackingSection";
 import { LayerJoinsSection } from "./LayerJoinsSection";
+import { QuickFiltersSection } from "./QuickFiltersSection";
 import { VirtualFieldsSection } from "./VirtualFieldsSection";
 import { getNetcdfLayerState, NETCDF_IMAGE_SOURCE_KIND } from "../../lib/netcdf-image-symbology";
+import { PasteStyleDialog } from "./PasteStyleDialog";
+import {
+  IMPORTED_STYLE_NOTE_DURATION_MS,
+  importedStyleNote,
+  type ImportedStyleNote,
+} from "../../lib/style-import-note";
 import { NetcdfProfilePanel } from "./NetcdfProfilePanel";
 import { NetcdfSymbologySection } from "./NetcdfSymbologySection";
 import { RasterSymbologySection } from "./RasterSymbologySection";
@@ -66,6 +90,7 @@ import { ExpressionBuilderDialog } from "../expressions/ExpressionBuilderDialog"
 import {
   ChevronDown,
   ChevronUp,
+  ClipboardType,
   CornerDownRight,
   Info,
   Palette,
@@ -86,8 +111,9 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
-import { loadedVectorTileFeatures } from "../../hooks/useVectorTileGeometryBackfill";
+import { loadedVectorTileFeatures, vectorTileMap } from "../../hooks/useVectorTileGeometryBackfill";
 import { clamp } from "../../lib/clamp";
 import {
   getAttributePropertyNames,
@@ -172,7 +198,9 @@ function labelOverrideInvalid(
 }
 
 interface StylePanelProps {
-  mapControllerRef: RefObject<MapController | null>;
+  mapControllerRef: RefObject<MapEngine | null>;
+  /** Bumped when the map (re)initializes; see {@link useQuickFilterProfiles}. */
+  mapReadyGeneration?: number;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
   /** Incremented when another part of the UI explicitly requests this panel. */
   openRequest?: number;
@@ -988,6 +1016,7 @@ function RasterStyleSlider({
 
 export function StylePanel({
   mapControllerRef,
+  mapReadyGeneration,
   onResizeStart,
   openRequest = 0,
   autoCollapse = false,
@@ -995,12 +1024,26 @@ export function StylePanel({
   onCollapsedChange,
   hideOwnRail = false,
 }: StylePanelProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
   const layers = useAppStore((s) => s.layers);
   const setLayerOpacity = useAppStore((s) => s.setLayerOpacity);
   const setLayerStyle = useAppStore((s) => s.setLayerStyle);
   const setStyleManagerOpen = useAppStore((s) => s.setStyleManagerOpen);
+  // The Mapbox compiler draws only part of the symbology below; see
+  // `mapboxUnsupportedStyleSettings`.
+  const mapboxPrimary = useAppStore((s) => s.primaryRenderer === "mapbox");
+  // Likewise for ArcGIS, whose 3D SceneView (the globe, or any view with
+  // terrain) draws a different subset from its flat MapView.
+  const arcgisPrimary = useAppStore((s) => s.primaryRenderer === "arcgis");
+  const arcgisScene = useAppStore(
+    (s) => s.preferences.map.projection === "globe" || s.preferences.map.terrainEnabled,
+  );
+  const [pasteStyleOpen, setPasteStyleOpen] = useState(false);
+  // What the last pasted style reported. The Layers panel has a per-row note for this; this
+  // panel has none, and dropping the parser's warnings would make an import that could not be
+  // fully represented look like a clean one.
+  const [pasteStyleNotice, setPasteStyleNotice] = useState<ImportedStyleNote | null>(null);
   const updateLayer = useAppStore((s) => s.updateLayer);
   const moveLayer = useAppStore((s) => s.moveLayer);
   const projectName = useAppStore((s) => s.projectName);
@@ -1137,11 +1180,26 @@ export function StylePanel({
       }
     | null
   >(null);
-  // Close the builder when the selected layer changes: its fields, sample
-  // features, and target expression all belong to the previous layer.
+  // Close both dialogs when the selected layer changes. The builder's fields, sample features and
+  // target expression all belong to the previous layer; a paste box left open would submit one
+  // layer's style onto another.
   useEffect(() => {
     setExpressionBuilderTarget(null);
+    setPasteStyleOpen(false);
+    setPasteStyleNotice(null);
   }, [selectedLayerId]);
+
+  // Fade the header note the way the Layers panel fades its row status. Without this a stale
+  // "Style imported." stays pinned under the header while the user keeps working on the same layer.
+  // The cleanup covers a second import, a change of layer, and unmount.
+  useEffect(() => {
+    if (!pasteStyleNotice) return;
+    const timer = window.setTimeout(
+      () => setPasteStyleNotice(null),
+      IMPORTED_STYLE_NOTE_DURATION_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [pasteStyleNotice]);
 
   const layer = layers.find((l) => l.id === selectedLayerId);
 
@@ -1280,7 +1338,8 @@ export function StylePanel({
       // Tiled sources only expose the features currently loaded, so an empty
       // sample means the tiles have not arrived yet rather than an empty
       // attribute — keep re-reading until the map settles with features.
-      const map = mapControllerRef.current?.getMap();
+      const engine = mapControllerRef.current;
+      const map = vectorTileMap(engine);
       if (!map) {
         setLoadedVectorPropertyValues(null);
         setVectorPropertyValuesUnavailable(true);
@@ -1288,7 +1347,7 @@ export function StylePanel({
         return;
       }
       const sampleValues = (): boolean => {
-        const features = loadedVectorTileFeatures(map, layer);
+        const features = loadedVectorTileFeatures(map, layer, engine?.kind);
         if (features.length === 0) return false;
         const byProperty: Record<string, unknown[]> = {};
         for (const property of propertiesToLoad) {
@@ -1672,6 +1731,16 @@ export function StylePanel({
     [layer?.type, layer?.geojson],
   );
 
+  // Blend-mode support is decided when the map installs its render wrappers,
+  // which can happen after this panel first renders, so subscribe rather than
+  // read the module state once. Kept above the early returns below so the hook
+  // order stays stable.
+  const blendModesSupported = useSyncExternalStore(
+    subscribeLayerBlendModeSupport,
+    layerBlendModesSupported,
+    layerBlendModesSupported,
+  );
+
   const resizeHandle = (
     <div
       role="separator"
@@ -1750,11 +1819,22 @@ export function StylePanel({
   const isDeckVectorLayer = hasExternalDeckLayer(layer);
   const isRasterTileLayer = layer.metadata.tileType === "raster";
   const isThreeDTilesLayer = layer.type === "3d-tiles";
+  // A CZML scene reuses the `3d-tiles` type so the globe owns it, but
+  // `CesiumLayerSync` only toggles its visibility: no `Cesium3DTileStyle` is
+  // compiled for it and no feature filter reaches its entities, so the tileset
+  // symbology and quick-filter controls would be silent no-ops (#2290).
+  const isNativeDocumentScene = isCzmlLayer(layer) || isCesiumKmlLayer(layer);
+  const hasTilesetSymbology = isThreeDTilesLayer && !isNativeDocumentScene;
   // An external plugin's MapLibre custom (WebGL) layer draws its own pixels and
   // has no MapLibre paint properties, so every paint editor below would be inert
   // for it (#1445). The plugin declares that with `paintMode: "plugin"`; the
   // panel then offers only what actually reaches the layer.
   const isPluginPaintedLayer = pluginOwnsPaint(layer);
+  // An ArcGIS vector-tile layer with its resolved style keeps the service's
+  // own paint: layer sync forwards only opacity, order, zoom range, and
+  // filters to its native layers, so the color editors would be inert.
+  const isServiceStyledLayer = layer.type === "arcgis" && arcgisVectorStyle(layer) !== null;
+  const blendModeSelectId = `blend-mode-${layer.id}`;
   // Opacity survives the suppression when (and only when) the plugin bridged a
   // setter for it; otherwise the slider would be the same inert control.
   const hasBridgedOpacity = isPluginPaintedLayer && supportsBridgedOpacity(layer.id);
@@ -1763,6 +1843,7 @@ export function StylePanel({
     !isRasterTileLayer &&
     !isDeckRasterLayer &&
     !isPluginPaintedLayer &&
+    !isServiceStyledLayer &&
     (layer.type === "geojson" ||
       layer.type === "vector-tiles" ||
       layer.type === "mbtiles" ||
@@ -1773,11 +1854,33 @@ export function StylePanel({
     !isRasterTileLayer &&
     !isDeckRasterLayer &&
     !isPluginPaintedLayer &&
+    !isServiceStyledLayer &&
     supportsExtrusionControls(layer);
   const hasRasterPaintControls =
     !isPluginPaintedLayer &&
     (isRasterPaintLayer(layer.type) || isRasterTileLayer || isDeckRasterLayer);
   const hasTextMarkerControls = layer.type === "geojson" && hasTextMarkerFeatures(layer);
+  // Quick filters compile to the per-feature MapLibre filter layer sync already
+  // applies, so they are offered exactly where that filter reaches: the layer
+  // types `withFeatureFilters` covers, plus any layer whose control registered
+  // native MapLibre layers for `applyExternalNativeFeatureFilters` to narrow
+  // (Add Vector Layer, vector PMTiles, and the plugin-painted vectors —
+  // filtering is independent of who owns the paint).
+  //
+  // Deliberately *not* keyed off `hasVectorPaintControls`: that set excludes
+  // plugin-painted layers, which do accept a filter, and includes deck.gl
+  // layers, which are MapLibre custom layers and accept none — offering a
+  // control there would be a control that quietly does nothing.
+  const hasQuickFilterControls =
+    // The deck.gl guard is outermost: a deck-rendered layer keeps its original
+    // `type` (a deck GeoJSON layer is still `"geojson"`), so testing the type
+    // first would let it through even though a custom layer accepts no filter.
+    !hasExternalDeckLayer(layer) &&
+    !isNativeDocumentScene &&
+    (layer.type === "geojson" ||
+      layer.type === "vector-tiles" ||
+      layer.type === "mbtiles" ||
+      hasExternalNativeLayers(layer));
   // isPointOnly is memoized above the early returns to keep hook order stable.
   const supportsPointRenderer = supportsPointRendererFor(layer, isPointOnly);
   // The "Sketches" layer mixes geometry types under one style, so "Circle
@@ -1789,6 +1892,19 @@ export function StylePanel({
   // for them, even if a hand-edited project set "meters".
   const strokeWidthInMeters = strokeWidthUnit === "meters" && !supportsPointRenderer;
   const pointRenderer = styleValue(style, "pointRenderer");
+  // Settings this layer turns on that the Mapbox renderer does not draw yet,
+  // named at the top of the panel so they do not silently do nothing.
+  const mapboxUnsupportedSettings =
+    mapboxPrimary && hasVectorPaintControls ? mapboxUnsupportedStyleSettings(layer) : [];
+  const arcgisUnsupportedSettings =
+    arcgisPrimary && hasVectorPaintControls
+      ? arcgisUnsupportedStyleSettings(layer, arcgisScene)
+      : [];
+  // A SceneView blends tiled rasters but ignores the colour sliders' effect.
+  const arcgisRasterEffectIgnored =
+    arcgisPrimary &&
+    arcgisScene &&
+    arcgisRasterEffect({ ...DEFAULT_LAYER_STYLE, ...style }) !== null;
   const extrusionEnabled = styleValue(style, "extrusionEnabled");
   const elevation3dEnabled = styleValue(style, "elevation3dEnabled");
   // Effective 3D Z-value mode: the saved flag can outlive the data's Z values
@@ -2175,6 +2291,33 @@ export function StylePanel({
       />
     </div>
   );
+  // How the layer composites onto the map beneath it (opengeos/GeoLibre#1981).
+  // Blending is applied while MapLibre draws the layer, so a layer painted by a
+  // plugin (`paintMode`) or rendered by a control (`customLayerType`: 3D Tiles,
+  // Gaussian splats, LiDAR, the COG raster engine, Add Vector Layer) can never
+  // honour it -- offering the menu there would only persist a mode nothing
+  // applies. `blendModesSupported` additionally drops it on a `maplibre-gl`
+  // build whose render seams moved; see `@geolibre/map`'s `layer-blend-modes`.
+  const blendModeControl =
+    !isPluginPaintedLayer && !controlRendersLayer(layer) && blendModesSupported ? (
+      <div className="space-y-2">
+        <Label htmlFor={blendModeSelectId}>{t("style.blendMode")}</Label>
+        <Select
+          id={blendModeSelectId}
+          aria-label={t("style.blendModeFor", { name: layer.name })}
+          value={styleValue(style, "blendMode") ?? DEFAULT_BLEND_MODE}
+          onChange={(event) =>
+            setLayerStyle(layer.id, { blendMode: event.target.value as BlendMode })
+          }
+        >
+          {BLEND_MODES.map((mode) => (
+            <option key={mode} value={mode}>
+              {t(`style.blendModes.${mode}` as ParseKeys)}
+            </option>
+          ))}
+        </Select>
+      </div>
+    ) : null;
   const usesAttributeSymbology =
     draftVectorStyleMode === "graduated" || draftVectorStyleMode === "categorized";
   const vectorClassificationSchemeOptions =
@@ -3428,6 +3571,7 @@ export function StylePanel({
     label: string,
     value: string,
     onSelect: (property: string) => void,
+    emptyLabel = t("style.generator.fieldNone"),
   ) => (
     <div className="space-y-2">
       <Label htmlFor={id}>{label}</Label>
@@ -3441,7 +3585,7 @@ export function StylePanel({
           <option value="">{t("style.labels.noAttributes")}</option>
         ) : (
           <>
-            <option value="">{t("style.generator.fieldNone")}</option>
+            <option value="">{emptyLabel}</option>
             {numericPropertyOptions.map((property) => (
               <option key={property} value={property}>
                 {property}
@@ -3915,6 +4059,58 @@ export function StylePanel({
             </Select>
           </div>
           <div className="space-y-2">
+            <label
+              htmlFor="labelNumberFormat"
+              className="flex items-center gap-2 text-sm font-medium"
+            >
+              <input
+                id="labelNumberFormat"
+                type="checkbox"
+                checked={labels.numberFormatEnabled}
+                onChange={(event) => updateLabels({ numberFormatEnabled: event.target.checked })}
+              />
+              {t("style.labels.numberFormat")}
+            </label>
+            {labels.numberFormatEnabled ? (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <NumericStyleInput
+                    id="labelNumberDecimals"
+                    label={t("style.labels.numberDecimals")}
+                    min={0}
+                    max={10}
+                    step={1}
+                    value={labels.numberDecimals}
+                    onChange={(numberDecimals) => updateLabels({ numberDecimals })}
+                  />
+                  <div className="space-y-2">
+                    <Label htmlFor="labelNumberLocale">{t("style.labels.numberLocale")}</Label>
+                    <Select
+                      id="labelNumberLocale"
+                      value={labels.numberLocale}
+                      onChange={(event) => updateLabels({ numberLocale: event.target.value })}
+                    >
+                      <option value="">{t("style.labels.numberLocaleApp")}</option>
+                      {LABEL_NUMBER_LOCALES.map((locale) => (
+                        <option key={locale} value={locale}>
+                          {formatLabelNumberSample(locale, labels.numberDecimals)}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t("style.labels.numberFormatHint", {
+                    sample: formatLabelNumberSample(
+                      labels.numberLocale || i18n.language,
+                      labels.numberDecimals,
+                    ),
+                  })}
+                </p>
+              </>
+            ) : null}
+          </div>
+          <div className="space-y-2">
             <Label htmlFor="labelPlacement">{t("style.labels.placement")}</Label>
             <Select
               id="labelPlacement"
@@ -4220,6 +4416,29 @@ export function StylePanel({
           </div>
           {pointRenderer === "heatmap" ? (
             <>
+              {!controlRendersLayer(layer) ? (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="heatmapColorRamp">{t("style.symbology.colormap")}</Label>
+                    <ColorRampSelect
+                      id="heatmapColorRamp"
+                      aria-label={t("style.symbology.colormap")}
+                      value={styleValue(style, "heatmapColorRamp")}
+                      onValueChange={(heatmapColorRamp) =>
+                        setLayerStyle(layer.id, { heatmapColorRamp })
+                      }
+                      ramps={VECTOR_COLOR_RAMPS}
+                    />
+                  </div>
+                  {generatorFieldSelect(
+                    "heatmapWeightProperty",
+                    t("style.symbology.heatmapWeightField"),
+                    styleValue(style, "heatmapWeightProperty"),
+                    (heatmapWeightProperty) => setLayerStyle(layer.id, { heatmapWeightProperty }),
+                    t("style.symbology.heatmapEqualWeight"),
+                  )}
+                </>
+              ) : null}
               <NumericStyleInput
                 id="heatmapRadius"
                 label={t("style.symbology.heatmapRadius")}
@@ -4592,11 +4811,13 @@ export function StylePanel({
     </>
   );
 
-  if (isPluginPaintedLayer) {
+  if (isPluginPaintedLayer || isServiceStyledLayer) {
     // The plugin paints this layer itself, so the panel keeps only the controls
     // that still reach it: insert-below and the zoom range (MapLibre honors both
     // on a custom layer) plus Opacity when the registration bridged setOpacity.
-    // Everything else is styled from the plugin's own panel.
+    // Everything else is styled from the plugin's own panel. A service-styled
+    // ArcGIS layer lands here too; its opacity is a native paint property, so
+    // the slider always reaches it.
     return (
       <aside aria-label={t("style.panelLabel")} className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
@@ -4619,7 +4840,7 @@ export function StylePanel({
           <div className="space-y-4 p-3 pe-5">
             {beforeIdControl}
             {zoomRangeControls}
-            {hasBridgedOpacity && (
+            {(hasBridgedOpacity || isServiceStyledLayer) && (
               <RasterStyleSlider
                 label={t("style.raster.opacity")}
                 value={layer.opacity}
@@ -4629,10 +4850,26 @@ export function StylePanel({
                 onChange={(value) => setLayerOpacity(layer.id, value)}
               />
             )}
+            {/* Filtering is independent of who owns the paint: layer sync
+                narrows a plugin-painted layer's native layers just like any
+                other, so the section belongs here too. */}
+            {hasQuickFilterControls ? (
+              <>
+                <Separator />
+                <QuickFiltersSection
+                  key={`qf-${layer.id}`}
+                  layer={layer}
+                  mapControllerRef={mapControllerRef}
+                  mapReadyGeneration={mapReadyGeneration}
+                />
+              </>
+            ) : null}
           </div>
         </ScrollArea>
         <Separator />
-        <p className="p-2 text-[10px] text-muted-foreground">{t("style.pluginPaintedFooter")}</p>
+        <p className="p-2 text-[10px] text-muted-foreground">
+          {t(isServiceStyledLayer ? "style.serviceStyledFooter" : "style.pluginPaintedFooter")}
+        </p>
       </aside>
     );
   }
@@ -4660,6 +4897,18 @@ export function StylePanel({
           {/* Padding on the inner content with extra right clearance so the
               overlay scrollbar never covers a control's right edge. */}
           <div className="space-y-4 p-3 pe-5">
+            {arcgisRasterEffectIgnored && (
+              <div
+                className="text-xs text-amber-600"
+                data-testid="style-arcgis-unsupported"
+                role="note"
+              >
+                <p>{t("style.arcgisUnsupported.title")}</p>
+                <ul className="list-disc ps-4">
+                  <li>{t("style.arcgisUnsupported.rasterEffectScene")}</li>
+                </ul>
+              </div>
+            )}
             {beforeIdControl}
             {zoomRangeControls}
             <RasterStyleSlider
@@ -4670,6 +4919,7 @@ export function StylePanel({
               step={0.05}
               onChange={(value) => setLayerOpacity(layer.id, value)}
             />
+            {blendModeControl}
             {!isDeckRasterLayer && (
               <>
                 <RasterStyleSlider
@@ -4734,7 +4984,7 @@ export function StylePanel({
               </>
             )}
             {layer.metadata.sourceKind === RASTER_SOURCE_KIND && (
-              <RasterSymbologySection layer={layer} />
+              <RasterSymbologySection layer={layer} mapControllerRef={mapControllerRef} />
             )}
             {/* A Time Slider source is not in the raster plugin's registry, so
                 the section above has nothing to attach to; its own spec fields
@@ -4811,6 +5061,7 @@ export function StylePanel({
         <ScrollArea className="flex-1">
           <div className="space-y-4 p-3 pe-5">
             {beforeIdControl}
+            {blendModeControl}
             {/* A NetCDF grid baked to pixels has no MapLibre paint properties,
                 so it lands in this branch; its colormap/limits are re-applied
                 by re-baking the image rather than by a style property. The
@@ -4818,15 +5069,48 @@ export function StylePanel({
                 still has to appear for a layer restored from one. */}
             {hasNetcdfSymbology ? (
               <NetcdfSymbologySection layer={layer} />
+            ) : hasTilesetSymbology ? (
+              // A tileset has no MapLibre paint properties, but the globe can
+              // classify its features from the same symbology every vector
+              // layer uses — `CesiumLayerSync` compiles the colour expression
+              // and the layer filter into a `Cesium3DTileStyle` (#2290). The
+              // attribute list comes from `metadata.fields`, which the globe
+              // fills in from the first rendered tile, so it appears once the
+              // tileset has drawn rather than while it is still loading.
+              <>
+                <p className="text-xs text-muted-foreground">{t("style.tilesetSymbology")}</p>
+                {vectorSymbologyControls}
+              </>
             ) : (
               <p className="text-xs text-muted-foreground">{t("style.noControls")}</p>
             )}
             {hasNetcdfSymbology && <NetcdfProfilePanel layerId={layer.id} />}
+            {/* A layer with no paint controls of its own (a plugin owns its
+                paint, or a control paints it) can still be filtered, so the
+                Quick filters section is offered here too rather than only in
+                the full vector panel below. */}
+            {hasQuickFilterControls ? (
+              <>
+                <Separator />
+                <QuickFiltersSection
+                  key={`qf-${layer.id}`}
+                  layer={layer}
+                  mapControllerRef={mapControllerRef}
+                  mapReadyGeneration={mapReadyGeneration}
+                />
+              </>
+            ) : null}
           </div>
         </ScrollArea>
         <Separator />
         <p className="p-2 text-[10px] text-muted-foreground">
-          {t("style.selectedLayerType", { type: layer.type })}
+          {t("style.selectedLayerType", {
+            type: isCesiumKmlLayer(layer)
+              ? "KML / KMZ"
+              : isNativeDocumentScene
+                ? "czml"
+                : layer.type,
+          })}
         </p>
       </aside>
     );
@@ -4844,16 +5128,33 @@ export function StylePanel({
               panel also serves mbtiles/plugin/deck layers, where the dialog
               would open with Apply/Save disabled. */}
           {isStyleLibraryTargetLayer(layer.type) && (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7"
-              title={t("style.openStyleManager")}
-              aria-label={t("style.openStyleManager")}
-              onClick={() => setStyleManagerOpen(true)}
-            >
-              <Palette className="h-4 w-4" />
-            </Button>
+            <>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title={t("style.openStyleManager")}
+                aria-label={t("style.openStyleManager")}
+                onClick={() => setStyleManagerOpen(true)}
+              >
+                <Palette className="h-4 w-4" />
+              </Button>
+              {/* The other door into this is the layer's actions menu, a long way from where
+                  someone thinking about symbology already is. */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title={t("layers.importStyleFromText")}
+                aria-label={t("layers.importStyleFromText")}
+                onClick={() => {
+                  setPasteStyleNotice(null);
+                  setPasteStyleOpen(true);
+                }}
+              >
+                <ClipboardType className="h-4 w-4" />
+              </Button>
+            </>
           )}
           <Button
             variant="ghost"
@@ -4867,6 +5168,45 @@ export function StylePanel({
           </Button>
         </div>
       </div>
+      {pasteStyleNotice && (
+        <p
+          className={`border-b px-3 py-1.5 text-xs ${
+            pasteStyleNotice.type === "warning" ? "text-amber-600" : "text-emerald-600"
+          }`}
+          data-testid="style-paste-notice"
+          role="status"
+        >
+          {pasteStyleNotice.message}
+        </p>
+      )}
+      {mapboxUnsupportedSettings.length > 0 && (
+        <div
+          className="border-b px-3 py-1.5 text-xs text-amber-600"
+          data-testid="style-mapbox-unsupported"
+          role="note"
+        >
+          <p>{t("style.mapboxUnsupported.title")}</p>
+          <ul className="list-disc ps-4">
+            {mapboxUnsupportedSettings.map((setting) => (
+              <li key={setting}>{t(`style.mapboxUnsupported.${setting}`)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {arcgisUnsupportedSettings.length > 0 && (
+        <div
+          className="border-b px-3 py-1.5 text-xs text-amber-600"
+          data-testid="style-arcgis-unsupported"
+          role="note"
+        >
+          <p>{t("style.arcgisUnsupported.title")}</p>
+          <ul className="list-disc ps-4">
+            {arcgisUnsupportedSettings.map((setting) => (
+              <li key={setting}>{t(`style.arcgisUnsupported.${setting}`)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       <ScrollArea className="flex-1">
         {/* Padding lives on the inner content (not the ScrollArea root) with
             extra right clearance so the overlay scrollbar never covers the
@@ -4877,6 +5217,7 @@ export function StylePanel({
               min/max zoom range, so hide the controls rather than show a
               silently-ignored setting. */}
           {!elevation3dActive && zoomRangeControls}
+          {blendModeControl}
           {hasExtrusionControls && (
             <div className="space-y-2">
               <Label>{t("style.visualization")}</Label>
@@ -4992,6 +5333,20 @@ export function StylePanel({
               {labelControls}
             </>
           ) : null}
+          {/* Quick filters narrow what the layer draws, so they apply to every
+              vector layer — including tile-backed ones, which profile the
+              features currently loaded rather than a local copy. */}
+          {hasQuickFilterControls ? (
+            <>
+              <Separator />
+              <QuickFiltersSection
+                key={`qf-${layer.id}`}
+                layer={layer}
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
+            </>
+          ) : null}
           {/* Persistent attribute joins need the layer's features in the store
               (layer.geojson); tile/service layers without an inline attribute
               table cannot be a join target. */}
@@ -5017,6 +5372,16 @@ export function StylePanel({
               <AttributeFormSection key={`af-${layer.id}`} layer={layer} />
             </>
           ) : null}
+          {/* The Popup designer reads the layer's field profile to offer the
+              fields, so like the sections above it needs the features in the
+              store. Keyed by layer so a half-edited expression never carries
+              over to the next layer. */}
+          {layer.geojson ? (
+            <>
+              <Separator />
+              <PopupSection key={`popup-${layer.id}`} layer={layer} />
+            </>
+          ) : null}
           {/* Editor tracking stamps the features as they are created and edited,
               so it needs the layer's features in the store as well. Keyed like
               the sections above so a half-typed column name never carries over
@@ -5040,6 +5405,20 @@ export function StylePanel({
               : t("style.footerMaplibre")}
       </p>
       {expressionBuilderDialog}
+      <PasteStyleDialog
+        open={pasteStyleOpen}
+        onOpenChange={setPasteStyleOpen}
+        onApply={(imported) => {
+          // Merge onto the store's current style, not the one this render closed over: the box can
+          // sit open while the panel's own controls edit the same layer. The layer *identity* is
+          // safe to close over, because a change of selection closes the dialog above.
+          const latest = useAppStore.getState().layers.find((c) => c.id === layer.id);
+          // Removed while the box was open — nothing to style.
+          if (!latest) return;
+          updateLayer(layer.id, { style: imported.apply(latest.style) });
+          setPasteStyleNotice(importedStyleNote(t, imported.warnings));
+        }}
+      />
     </aside>
   );
 }

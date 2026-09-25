@@ -1,6 +1,6 @@
 // Uploads a serialized GeoLibre project to a share server via its
-// `POST /api/projects` endpoint, authenticated with a personal API token the
-// user created on that server. Used by the Project > Share action.
+// `POST /api/projects` endpoint, authenticated with an OAuth access token or
+// a personal API token. Used by the Project > Share action.
 //
 // The host is share.geolibre.app unless the deployment names another one; see
 // `resolveShareHost` for the precedence and for why a rejected value disables
@@ -21,10 +21,10 @@ export type ShareVisibility = "public" | "unlisted" | "private" | "organization"
 /**
  * Machine-readable cause for an upload failure the dialog can react to. Only
  * conditions that warrant dedicated UI (beyond showing the message) get a code.
- * `username-required` means the account has no username yet, which the user must
- * set on the share.geolibre.app website before any upload can succeed.
+ * `username-required` directs the user to account settings; `unauthorized`
+ * prompts a fresh sign-in or replacement personal token.
  */
-export type ShareUploadErrorCode = "username-required";
+export type ShareUploadErrorCode = "username-required" | "unauthorized";
 
 /**
  * Error thrown by {@link uploadProjectToShare}. Carries a human-readable message
@@ -181,20 +181,17 @@ export interface ShareHost {
 
 /**
  * Whether a URL is safe to send a Bearer token to: HTTPS anywhere, or HTTP on
- * loopback for local development, and never with credentials in the URL.
+ * loopback for local development. Share base URLs cannot include credentials,
+ * query strings, or fragments.
  *
  * The hostname is matched exactly rather than by prefix — `startsWith(
  * "http://localhost")` would also accept `http://localhost.evil.com`. A
  * self-hosted server on a private network therefore needs TLS; see
  * `docs/getting-started.md`.
- *
- * Embedded credentials are rejected regardless of scheme, mirroring the
- * `service_url()` validator in `docker/entrypoint.sh`: a `https://user:pass@host`
- * base would send Basic Auth alongside the Bearer token on every request, and
- * the value reaches log output and error messages.
  */
 function isSafeShareUrl(url: URL): boolean {
-  if (url.username || url.password) return false;
+  if (url.username || url.password || url.href.includes("?") || url.href.includes("#"))
+    return false;
   if (url.protocol === "https:") return true;
   return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1");
 }
@@ -469,8 +466,8 @@ export async function fetchSharedProjectVersions(
     throw new Error(`Could not reach ${hostOf(base)}. Check your internet connection.`);
   }
   if (!response.ok) {
-    const { message } = await uploadErrorInfo(response);
-    throw new Error(message);
+    const { message, code } = await uploadErrorInfo(response);
+    throw new ShareUploadError(message, code);
   }
   const payload = (await response.json().catch(() => null)) as { versions?: unknown } | null;
   if (!Array.isArray(payload?.versions)) {
@@ -501,7 +498,7 @@ async function uploadErrorInfo(
   response: Response,
 ): Promise<{ message: string; code?: ShareUploadErrorCode }> {
   if (response.status === 401) {
-    return { message: "Invalid or expired API token. Update it in Settings." };
+    return { message: "unauthorized", code: "unauthorized" };
   }
   if (response.status === 403) {
     return { message: "This API token is not allowed to upload projects." };

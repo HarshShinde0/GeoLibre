@@ -11,6 +11,7 @@ import {
 } from "@geolibre/ui";
 import { Loader2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import {
   LARGE_EMBED_WARNING_BYTES,
@@ -19,7 +20,18 @@ import {
 } from "../../../hooks/useProjectFileActions";
 import type { ArcgisProjectImportWarning } from "../../../lib/arcgis-project-import";
 import type { QgisProjectImportWarning } from "../../../lib/qgis-project-import";
-import { fetchSharedProjectVersions, type SharedProjectVersion } from "../../../lib/share-geolibre";
+import {
+  fetchSharedProjectVersions,
+  shareHostLabel,
+  ShareUploadError,
+  type SharedProjectVersion,
+} from "../../../lib/share-geolibre";
+import {
+  resolveShareRequestToken,
+  ShareOAuthError,
+  shareOAuthErrorKey,
+  supportsShareOAuth,
+} from "../../../lib/share-oauth";
 import { SaveTemplateDialog } from "../SaveTemplateDialog";
 import { ImportWarningList } from "./ImportWarningList";
 
@@ -59,6 +71,41 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
 
   return (
     <>
+      <Dialog
+        open={projectFiles.droppedProjectPrompt !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) void projectFiles.resolveDroppedProjectPrompt("cancel");
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("toolbar.fileDrop.savePromptTitle")}</DialogTitle>
+            <DialogDescription>{t("toolbar.fileDrop.savePromptDescription")}</DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              disabled={projectFiles.droppedProjectSaving}
+              onClick={() => void projectFiles.resolveDroppedProjectPrompt("cancel")}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={projectFiles.droppedProjectSaving}
+              onClick={() => void projectFiles.resolveDroppedProjectPrompt("discard")}
+            >
+              {t("newProject.doNotSave")}
+            </Button>
+            <Button
+              disabled={projectFiles.droppedProjectSaving}
+              onClick={() => void projectFiles.resolveDroppedProjectPrompt("save")}
+            >
+              {t("common.save")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={projectFiles.projectUrlDialogOpen}
         onOpenChange={projectFiles.handleProjectUrlDialogOpenChange}
@@ -260,9 +307,13 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
             <DialogTitle>{t("toolbar.item.embedVectorTitle")}</DialogTitle>
             <DialogDescription>
               {t(
-                projectFiles.embedVectorDataPrompt?.desktop
-                  ? "toolbar.item.embedVectorDescDesktop"
-                  : "toolbar.item.embedVectorDesc",
+                projectFiles.embedVectorDataPrompt?.hasGeometryEdits
+                  ? "toolbar.item.embedEditedGeometryDesc"
+                  : projectFiles.embedVectorDataPrompt?.allowFileReferences
+                    ? "toolbar.item.embedVectorDescDesktop"
+                    : projectFiles.embedVectorDataPrompt?.desktop
+                      ? "toolbar.item.embedVectorDescMas"
+                      : "toolbar.item.embedVectorDesc",
                 {
                   count: projectFiles.embedVectorDataPrompt?.count ?? 0,
                   size: formatByteSize(projectFiles.embedVectorDataPrompt?.bytes ?? 0),
@@ -287,16 +338,19 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
             >
               {t("common.cancel")}
             </Button>
-            <Button
-              variant="outline"
-              onClick={() => projectFiles.resolveEmbedVectorDataPrompt("noembed")}
-            >
-              {t(
-                projectFiles.embedVectorDataPrompt?.desktop
-                  ? "toolbar.item.embedVectorReferenceButton"
-                  : "toolbar.item.embedVectorSkipButton",
-              )}
-            </Button>
+            {projectFiles.embedVectorDataPrompt?.allowFileReferences ||
+            !projectFiles.embedVectorDataPrompt?.desktop ? (
+              <Button
+                variant="outline"
+                onClick={() => projectFiles.resolveEmbedVectorDataPrompt("noembed")}
+              >
+                {t(
+                  projectFiles.embedVectorDataPrompt?.desktop
+                    ? "toolbar.item.embedVectorReferenceButton"
+                    : "toolbar.item.embedVectorSkipButton",
+                )}
+              </Button>
+            ) : null}
             <Button onClick={() => projectFiles.resolveEmbedVectorDataPrompt("embed")}>
               {t("toolbar.item.embedVectorEmbedButton")}
             </Button>
@@ -314,6 +368,18 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
       />
     </>
   );
+}
+
+/** Credential failures read as sign-in guidance rather than a raw code. */
+function historyErrorMessage(caught: unknown, t: TFunction): string {
+  if (caught instanceof ShareOAuthError) return t(shareOAuthErrorKey(caught.code));
+  if (caught instanceof ShareUploadError && caught.code === "unauthorized") {
+    return t(
+      supportsShareOAuth() ? "gallery.errorUnauthorizedOAuth" : "gallery.errorUnauthorized",
+      { shareHost: shareHostLabel() },
+    );
+  }
+  return caught instanceof Error ? caught.message : t("toolbar.item.serverHistoryError");
 }
 
 function SharedProjectVersionsDialog({
@@ -342,19 +408,21 @@ function SharedProjectVersionsDialog({
     setVersions([]);
     setError(null);
     setLoading(true);
-    void fetchSharedProjectVersions({
-      token: target.token,
-      projectId: target.id,
-      baseUrl: target.baseUrl,
-      signal: controller.signal,
-    })
+    // OAuth access token when signed in, else the personal-token fallback.
+    void resolveShareRequestToken(target.token, target.baseUrl)
+      .then((token) =>
+        fetchSharedProjectVersions({
+          token,
+          projectId: target.id,
+          baseUrl: target.baseUrl,
+          signal: controller.signal,
+        }),
+      )
       .then((items) => {
         if (!controller.signal.aborted) setVersions(items);
       })
       .catch((caught) => {
-        if (!controller.signal.aborted) {
-          setError(caught instanceof Error ? caught.message : t("toolbar.item.serverHistoryError"));
-        }
+        if (!controller.signal.aborted) setError(historyErrorMessage(caught, t));
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -409,15 +477,10 @@ function SharedProjectVersionsDialog({
                   variant="outline"
                   onClick={() => {
                     if (!target) return;
-                    void onOpenVersion(version.rawUrl, target.token)
+                    void resolveShareRequestToken(target.token, target.baseUrl)
+                      .then((token) => onOpenVersion(version.rawUrl, token))
                       .then(handleClose)
-                      .catch((caught) => {
-                        setError(
-                          caught instanceof Error
-                            ? caught.message
-                            : t("toolbar.item.serverHistoryError"),
-                        );
-                      });
+                      .catch((caught) => setError(historyErrorMessage(caught, t)));
                   }}
                 >
                   {t("gallery.openCopy")}

@@ -1,6 +1,6 @@
 export const GEOLIBRE_WEB_URL = "https://web.geolibre.app/";
 
-/** Build the repeated data/style deep link consumed by GeoLibre. */
+/** Build the repeated data/style/dataType deep link consumed by GeoLibre. */
 export function buildGeoLibreUrl(datasets, baseUrl = GEOLIBRE_WEB_URL) {
   if (!Array.isArray(datasets) || datasets.length === 0) {
     throw new Error("Select at least one dataset.");
@@ -30,7 +30,10 @@ export function buildGeoLibreUrl(datasets, baseUrl = GEOLIBRE_WEB_URL) {
       throw new Error("GeoLibre can only open HTTP or HTTPS service links.");
     }
     target.searchParams.set("add", serviceKinds[service.format]);
-    target.searchParams.set("serviceUrl", service.url);
+    // A tileset known only through its style has the style as its own URL, and
+    // GeoLibre reads the tiles out of that document: handing the same URL over
+    // as the service URL as well would have it parsed as TileJSON and fail.
+    if (service.url !== service.styleUrl) target.searchParams.set("serviceUrl", service.url);
     // The layer and style the page was rendering: without them the dialog opens
     // on an endpoint whose layer field is empty and cannot be submitted.
     if (service.layer) target.searchParams.set("serviceLayer", service.layer);
@@ -52,11 +55,16 @@ export function buildGeoLibreUrl(datasets, baseUrl = GEOLIBRE_WEB_URL) {
     if (styleUrl && styleUrl.protocol !== "http:" && styleUrl.protocol !== "https:") {
       throw new Error("GeoLibre can only open HTTP or HTTPS style links.");
     }
-    return { dataUrl, styleUrl };
+    return { dataUrl, styleUrl, dataType: dataset.dataType ?? null };
   });
   for (const entry of entries) target.searchParams.append("data", entry.dataUrl.href);
   if (entries.some((entry) => entry.styleUrl)) {
     for (const entry of entries) target.searchParams.append("style", entry.styleUrl?.href ?? "");
+  }
+  // Paired by position like `style`: a point cloud behind an extensionless
+  // endpoint is opened as one only when its slot says `lidar`.
+  if (entries.some((entry) => entry.dataType)) {
+    for (const entry of entries) target.searchParams.append("dataType", entry.dataType ?? "");
   }
   return target.href;
 }

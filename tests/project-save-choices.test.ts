@@ -1,11 +1,27 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  canSaveVectorFileReferences,
+  durableVectorDataChoice,
   rememberProjectSaveChoices,
   reusableCredentialChoice,
   reusableVectorDataChoice,
   saveChoicesForProject,
 } from "../apps/geolibre-desktop/src/lib/project-save-choices";
+
+describe("Mac App Store vector saves", () => {
+  it("disables path-only projects in the sandboxed build", () => {
+    assert.equal(canSaveVectorFileReferences(true, true), false);
+    assert.equal(canSaveVectorFileReferences(true, false), true);
+    assert.equal(canSaveVectorFileReferences(false, false), false);
+  });
+
+  it("turns stale reference choices into durable embedded saves", () => {
+    assert.equal(durableVectorDataChoice("noembed", true), "embed");
+    assert.equal(durableVectorDataChoice("noembed", false), "noembed");
+    assert.equal(durableVectorDataChoice("cancel", true), "cancel");
+  });
+});
 
 describe("project save choices", () => {
   it("remembers credential and vector-data choices for the current project", () => {
@@ -155,4 +171,19 @@ describe("project save choices", () => {
     const strip = rememberProjectSaveChoices(null, 4, { credentials: "strip" });
     assert.equal(reusableCredentialChoice(strip, risk(["basemapStyleUrl=q7"])), "strip");
   });
+});
+
+it("reconfirms saving without geometry edits even for an acknowledged layer", () => {
+  const choice = rememberProjectSaveChoices(null, 1, {
+    vectorData: "noembed",
+    discardedVectorLayerIds: ["buildings"],
+  });
+  const risk = {
+    embedBytes: 1000,
+    warningBytes: 50000000,
+    discardedLayerIds: ["buildings"],
+    editedLayerIds: ["buildings"],
+  };
+  assert.equal(reusableVectorDataChoice(choice, risk), undefined);
+  assert.equal(reusableVectorDataChoice({ ...choice, vectorData: "embed" }, risk), "embed");
 });

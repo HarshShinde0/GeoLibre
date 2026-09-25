@@ -1,14 +1,21 @@
-import { useAppStore, type MapProjection } from "@geolibre/core";
+import { useAppStore, type MapProjection, type MapViewState } from "@geolibre/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { dataUrlParameters, serviceUrlParameter } from "../lib/data-url";
 import { isTauri } from "../lib/is-tauri";
 import { projectUrlFromLocation } from "../lib/project-url";
-import { planStartup, startupDefaultProjection, type StartupPlan } from "../lib/startup-project";
+import { planStartup, startupDefaultWorkspace, type StartupPlan } from "../lib/startup-project";
 import { openRecentProjectFile, RecentProjectGoneError } from "../lib/tauri-io";
 import { resolveProjectXyzLayers } from "../lib/xyz-url";
 import { DEFAULT_STARTUP_SETTINGS, useDesktopSettingsStore } from "./useDesktopSettings";
 import { loadRecentProjects } from "./useRecentProjectsPersistence";
+import { consumeInlineProjectFragment } from "../lib/inline-project-fragment";
+import { initialNativeProjectPath } from "../lib/native-project-open";
+import { coordinateTargetFromSearch } from "../lib/coordinate-url";
+import {
+  initialNativeCoordinateTarget,
+  finishNativeCoordinateStartup,
+} from "../lib/native-coordinate-open";
 
 /**
  * How long the shell stays unmounted waiting for a startup restore. The read and
@@ -49,7 +56,7 @@ function hasExplicitLaunchPayload(): boolean {
  * render (`useDesktopSettingsStore` hydrates from localStorage at store-creation
  * time), so both calls see the same answer.
  */
-function currentStartupPlan(): StartupPlan {
+function currentStartupPlan(openedProjectPath: string | null = null): StartupPlan {
   // `useRecentProjectsPersistence` hydrates the store from localStorage in its
   // own mount effect. Fall back to reading storage directly when that has not
   // happened yet, so "last project" mode does not silently no-op if this hook is
@@ -58,17 +65,25 @@ function currentStartupPlan(): StartupPlan {
   return planStartup({
     explicitPayload: hasExplicitLaunchPayload(),
     desktop: isTauri(),
+    openedProjectPath,
     settings: useDesktopSettingsStore.getState().desktopSettings.startup,
     recentProjects: stored.length > 0 ? stored : loadRecentProjects(),
   });
 }
 
-/** Seed the empty workspace's projection, without marking the project dirty. */
-function applyDefaultProjection(projection: MapProjection): void {
+/** Seed the empty workspace's camera and projection without marking the project dirty. */
+function applyDefaultWorkspace(
+  workspace: Pick<MapViewState, "center" | "zoom"> & { projection: MapProjection },
+): void {
   useAppStore.setState((state) => ({
+    mapView: {
+      ...state.mapView,
+      center: [...workspace.center],
+      zoom: workspace.zoom,
+    },
     preferences: {
       ...state.preferences,
-      map: { ...state.preferences.map, projection },
+      map: { ...state.preferences.map, projection: workspace.projection },
     },
   }));
 }
@@ -79,6 +94,18 @@ export function useStartupProject(): {
 } {
   const { t } = useTranslation();
   const [hasWarning, setHasWarning] = useState(false);
+  // Consume a direct-file export before the shell and MapCanvas mount. Loading
+  // it here gives it the same startup precedence as a ?url= deep link and, more
+  // importantly, prevents the default-workspace initializer from replacing it.
+  const [inlineProject] = useState(() => {
+    try {
+      return consumeInlineProjectFragment();
+    } catch (error) {
+      console.error("[GeoLibre] Could not load the direct-file project", error);
+      return null;
+    }
+  });
+  const [openedProjectPath] = useState(initialNativeProjectPath);
   // Keep the workspace unmounted while a configured startup project is being
   // read. Otherwise MapCanvas is created from the empty project's defaults
   // (notably globe projection), and the asynchronous project restore has to
@@ -96,19 +123,43 @@ export function useStartupProject(): {
   // during render is safe here: it happens once, before any subscriber has
   // rendered, and re-running the initializer would set the same value.
   const [restoring, setRestoring] = useState(() => {
-    const plan = currentStartupPlan();
-    if (plan.kind === "default") applyDefaultProjection(plan.projection);
+    if (inlineProject) {
+      useAppStore.getState().loadProject(inlineProject, null, { rememberRecent: false });
+      return false;
+    }
+    const location =
+      initialNativeCoordinateTarget() ?? coordinateTargetFromSearch(window.location.search);
+    if (location && !hasExplicitLaunchPayload() && !openedProjectPath) {
+      applyDefaultWorkspace({
+        ...startupDefaultWorkspace(useDesktopSettingsStore.getState().desktopSettings.startup),
+        ...location,
+      });
+      return false;
+    }
+    const plan = currentStartupPlan(openedProjectPath);
+    if (plan.kind === "default") applyDefaultWorkspace(plan);
     return plan.kind === "restore";
   });
 
+  // End native startup in the same synchronous render that reads its target.
+  // Waiting for the passive effect would drop intents received after render.
+  finishNativeCoordinateStartup();
+
   useEffect(() => {
-    const plan = currentStartupPlan();
+    if (inlineProject) return;
+    if (
+      (initialNativeCoordinateTarget() || coordinateTargetFromSearch(window.location.search)) &&
+      !hasExplicitLaunchPayload() &&
+      !openedProjectPath
+    )
+      return;
+    const plan = currentStartupPlan(openedProjectPath);
     // Both other cases were settled by the initializer above.
     if (plan.kind !== "restore") return;
     const path = plan.path;
     const settings = useDesktopSettingsStore.getState().desktopSettings.startup;
     const openDefaultWorkspace = () => {
-      applyDefaultProjection(startupDefaultProjection(settings));
+      applyDefaultWorkspace(startupDefaultWorkspace(settings));
       setRestoring(false);
     };
 
@@ -203,7 +254,7 @@ export function useStartupProject(): {
     // Startup restoration is intentionally one-shot. In particular, changing
     // language must not reopen this project over the user's current workspace.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [inlineProject, openedProjectPath]);
 
   return {
     warning: hasWarning ? t("settings.startup.loadWarning") : null,

@@ -43,6 +43,7 @@ export const GEOMETRY_EDIT_FID_PROPERTY = "__geolibre_fid";
  */
 export function canEditLayerGeometry(layer: GeoLibreLayer | undefined): boolean {
   if (!layer) return false;
+  if (layer.capabilities?.update === false) return false;
   // Only geojson-mode vector layers; "vector-tiles" (DuckDB tiles) are excluded.
   if (layer.type !== "geojson") return false;
   if (isDuckDBQueryLayer(layer)) return false;
@@ -568,4 +569,25 @@ function overlayLayersAlreadyPositioned(
   }
   const after = layers[start + overlayCount];
   return !(after && after.isOverlay);
+}
+
+/**
+ * Mark committed geometry edits by comparing the editor's load-time feature
+ * tags before reconciliation strips them or allocates ids for new features.
+ */
+export function geometryEditMetadata(
+  layer: GeoLibreLayer,
+  tagged: FeatureCollection,
+  originalGeometries: ReadonlyMap<string, string>,
+): GeoLibreLayer["metadata"] {
+  const seen = new Set<string>();
+  const changed =
+    originalGeometries.size !== tagged.features.length ||
+    tagged.features.some((feature) => {
+      const tag = feature.properties?.[GEOMETRY_EDIT_FID_PROPERTY];
+      if (tag == null || seen.has(String(tag))) return true;
+      seen.add(String(tag));
+      return canonicalGeometryKey(feature.geometry) !== originalGeometries.get(String(tag));
+    });
+  return changed ? { ...layer.metadata, geometryEdited: true } : layer.metadata;
 }
